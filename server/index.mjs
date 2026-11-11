@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
+import { timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -10,9 +11,12 @@ const API_KEY = process.env.RIOT_API_KEY
 const KR = 'https://kr.api.riotgames.com'
 const ASIA = 'https://asia.api.riotgames.com'
 const DDRAGON = 'https://ddragon.leagueoflegends.com'
-const DATA_DIR = path.join(process.cwd(), 'data')
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), 'data')
 const CACHE_PATH = path.join(DATA_DIR, 'riot-season-cache.json')
 const USERS_PATH = path.join(DATA_DIR, 'users.json')
+const DIST_DIR = path.join(process.cwd(), 'dist')
+const APP_USERNAME = process.env.APP_USERNAME || 'chamlog'
+const APP_PASSWORD = process.env.APP_PASSWORD || ''
 const RIOT_REQUEST_INTERVAL_MS = 1250
 let championCatalogPromise
 let cacheWriteChain = Promise.resolve()
@@ -20,6 +24,33 @@ let nextRiotRequestAt = 0
 const syncJobs = new Map()
 
 app.use(cors({ origin: 'http://localhost:5173' }))
+app.get('/api/health', (_request, response) => response.json({ configured: Boolean(API_KEY) }))
+
+if (process.env.NODE_ENV === 'production' && !APP_PASSWORD) {
+  throw new Error('APP_PASSWORD must be set in production.')
+}
+
+function sameSecret(left, right) {
+  const leftBuffer = Buffer.from(left)
+  const rightBuffer = Buffer.from(right)
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer)
+}
+
+function requireAppAccess(request, response, next) {
+  if (!APP_PASSWORD) return next()
+  const [scheme, encodedCredentials] = (request.get('authorization') || '').split(' ')
+  if (scheme === 'Basic' && encodedCredentials) {
+    const credentials = Buffer.from(encodedCredentials, 'base64').toString('utf8')
+    const separator = credentials.indexOf(':')
+    const username = separator >= 0 ? credentials.slice(0, separator) : ''
+    const password = separator >= 0 ? credentials.slice(separator + 1) : ''
+    if (sameSecret(username, APP_USERNAME) && sameSecret(password, APP_PASSWORD)) return next()
+  }
+  response.set('WWW-Authenticate', 'Basic realm="Chamlog"')
+  return response.status(401).send('Chamlog access authentication is required.')
+}
+
+app.use(requireAppAccess)
 app.use(express.json())
 
 class RiotApiError extends Error {
@@ -245,8 +276,6 @@ function buildChampionStats(matches, masteries, catalog) {
   }).filter(Boolean)
 }
 
-app.get('/api/health', (_request, response) => response.json({ configured: Boolean(API_KEY) }))
-
 app.get('/api/users', async (_request, response) => {
   response.json({ users: await loadUsers() })
 })
@@ -374,4 +403,10 @@ app.delete('/api/riot/sync/:jobId', (request, response) => {
   response.json(jobResponse(job))
 })
 
-app.listen(PORT, () => console.log(`Riot API server listening on http://localhost:${PORT}`))
+app.use(express.static(DIST_DIR))
+app.use((request, response) => {
+  if (request.path.startsWith('/api/')) return response.status(404).json({ message: 'API 경로를 찾지 못했습니다.' })
+  return response.sendFile(path.join(DIST_DIR, 'index.html'))
+})
+
+app.listen(PORT, '0.0.0.0', () => console.log(`Chamlog server listening on port ${PORT}`))

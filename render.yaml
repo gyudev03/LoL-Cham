@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: chamlog-private
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: APP_USERNAME
+        value: chamlog
+      - key: APP_PASSWORD
+        sync: false
+      - key: RIOT_API_KEY
+        sync: false
+      - key: SEASON_START
+        sync: false
+    disk:
+      name: chamlog-data
+      mountPath: /var/data
+      sizeGB: 1
