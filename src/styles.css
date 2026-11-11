@@ -23,6 +23,9 @@ button, input, select { font: inherit; } button { cursor: pointer; } button:disa
 
 .status-dot.error { background: #df7d75; box-shadow: 0 0 0 3px #583337; }
 .sync-error { display: flex; align-items: center; gap: 7px; margin: 14px 0 -4px; padding: 11px 14px; color: #e8aaa2; background: #35252a; border: 1px solid #653c42; border-radius: 8px; font-size: 12px; }
+.sync-notice { display: flex; align-items: center; gap: 7px; margin: 14px 0 -4px; padding: 11px 14px; color: #9bd1bc; background: #18332d; border: 1px solid #31584d; border-radius: 8px; font-size: 12px; }
+.sync-timing { display: block; margin-top: 3px !important; color: #c8a96e !important; }
+.refresh-button.cancel-sync { color: #f5d7d1; background: #713d3d; }.refresh-button.cancel-sync:hover { background: #8e4c4c; }
 .tier-— { color: #8490a3; background: #293244; }
 .analysis-note { display: flex; align-items: center; gap: 5px; margin: 11px 0 0; padding: 8px 9px; color: #dfbf81; background: #322b20; border: 1px solid #5c4a2b; border-radius: 5px; font-size: 10px; line-height: 1.5; }
 .modal-error { display: flex; align-items: center; gap: 6px; margin: 14px 0 0; color: #e8aaa2; font-size: 11px; }

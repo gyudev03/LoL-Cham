@@ -11,6 +11,7 @@ type Profile = {
   name: string
   riotId: string
   tag: string
+  puuid?: string
   lane: Lane
   active: boolean
   syncedAt: Date
@@ -105,12 +106,25 @@ const initialProfiles: Profile[] = [
 
 function formatMastery(value: number) { return new Intl.NumberFormat('ko-KR').format(value) }
 function syncAge(date: Date) {
+  if (!Number.isFinite(date.getTime()) || date.getTime() <= 0) return '동기화 기록 없음'
   const hours = Math.max(0, Math.floor((Date.now() - date.getTime()) / 3600000))
   return hours === 0 ? '방금 전' : `${hours}시간 전`
+}
+function formatDuration(totalSeconds: number) {
+  const seconds = Math.max(0, Math.ceil(totalSeconds))
+  const minutes = Math.floor(seconds / 60)
+  return minutes ? `${minutes}분 ${seconds % 60}초` : `${seconds}초`
 }
 
 function tierClass(tier: Champion['tier']) { return `tier tier-${tier.toLowerCase()}` }
 function championEntryId(champion: Champion) { return champion.entryId ?? champion.id }
+function aiGrade(score: number | null) {
+  if (score === null) return '데이터 부족'
+  if (score >= 80) return '매우 숙련'
+  if (score >= 65) return '안정적'
+  if (score >= 50) return '보통'
+  return '보완 필요'
+}
 
 export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([])
@@ -123,6 +137,9 @@ export default function App() {
   const [isSyncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
   const [syncProgress, setSyncProgress] = useState('')
+  const [syncTiming, setSyncTiming] = useState('')
+  const [syncJobId, setSyncJobId] = useState<string | null>(null)
+  const [syncNotice, setSyncNotice] = useState('')
   const [profileError, setProfileError] = useState('')
   const [isLiveData, setLiveData] = useState(false)
   const [query, setQuery] = useState('')
@@ -141,7 +158,7 @@ export default function App() {
         const active = savedProfiles.find((item: Profile) => item.active) ?? savedProfiles[0]
         setProfileId(active.id)
         setLane(active.lane)
-        void refreshData(active)
+        void loadCachedData(active)
       } catch (error) {
         setProfileError(error instanceof Error ? error.message : '사용자 정보를 불러오지 못했습니다.')
       }
@@ -159,11 +176,35 @@ export default function App() {
     if (first) setSelectedId(championEntryId(first))
   }
 
+  async function loadCachedData(targetProfile: Profile) {
+    setSyncError('')
+    setChampionData([])
+    setSelectedId('')
+    setLiveData(false)
+    if (!targetProfile.puuid) return
+    try {
+      const response = await fetch(`/api/riot/summary/${encodeURIComponent(targetProfile.puuid)}`)
+      if (response.status === 404) return
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.message || '저장된 분석 데이터를 불러오지 못했습니다.')
+      if (!payload.champions?.length) return
+      setChampionData(payload.champions)
+      setLiveData(true)
+      const preferred = payload.champions.find((champion: Champion) => champion.lane === targetProfile.lane) ?? payload.champions[0]
+      setLane(preferred.lane)
+      setSelectedId(championEntryId(preferred))
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : '저장된 분석 데이터를 불러오지 못했습니다.')
+    }
+  }
+
   async function refreshData(targetProfile = profile) {
     if (!targetProfile) return
     setSyncing(true)
     setSyncError('')
+    setSyncNotice('')
     setSyncProgress('동기화 작업을 시작하는 중')
+    setSyncTiming('')
     try {
       const response = await fetch('/api/riot/sync', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -171,12 +212,13 @@ export default function App() {
       })
       const payload = await response.json()
       if (!response.ok) throw new Error(payload.message || '동기화 중 오류가 발생했습니다.')
+      setSyncJobId(payload.id)
       const result = await waitForSync(payload.id)
       if (!result.champions.length) throw new Error('이번 시즌에 분석 가능한 솔로·자유랭크 전적을 찾지 못했습니다.')
       setChampionData(result.champions)
       setLiveData(true)
       setProfiles((current) => {
-        const nextProfiles = current.map((item) => item.id === targetProfile.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, syncedAt: new Date(result.syncedAt) } : item)
+        const nextProfiles = current.map((item) => item.id === targetProfile.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) } : item)
         void persistProfiles(nextProfiles).catch((error) => setProfileError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.'))
         return nextProfiles
       })
@@ -184,11 +226,21 @@ export default function App() {
       setLane(preferred.lane)
       setSelectedId(championEntryId(preferred))
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.')
+      const message = error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.'
+      if (message === '동기화가 취소되었습니다.') setSyncNotice('동기화를 취소했습니다. 수집된 게임은 다음 동기화 때 재사용됩니다.')
+      else setSyncError(message)
     } finally {
       setSyncing(false)
       setSyncProgress('')
+      setSyncTiming('')
+      setSyncJobId(null)
     }
+  }
+
+  async function cancelSync() {
+    if (!syncJobId) return
+    setSyncProgress('동기화 취소를 요청하는 중')
+    await fetch(`/api/riot/sync/${syncJobId}`, { method: 'DELETE' })
   }
 
   async function persistProfiles(nextProfiles: Profile[]) {
@@ -207,18 +259,22 @@ export default function App() {
     await persistProfiles(nextProfiles)
     setProfiles(nextProfiles)
     const nextActive = nextProfiles.find((item) => item.id === profileId && item.active) ?? nextProfiles.find((item) => item.active)
-    if (nextActive) { setProfileId(nextActive.id); setLane(nextActive.lane); void refreshData(nextActive) }
+    if (nextActive) { setProfileId(nextActive.id); setLane(nextActive.lane); void loadCachedData(nextActive) }
     setUserModalOpen(false)
   }
 
-  async function waitForSync(jobId: string): Promise<{ champions: Champion[]; account: { gameName: string; tagLine: string }; syncedAt: string }> {
+  async function waitForSync(jobId: string): Promise<{ champions: Champion[]; account: { puuid: string; gameName: string; tagLine: string }; syncedAt: string }> {
     while (true) {
       const response = await fetch(`/api/riot/sync/${jobId}`)
       const payload = await response.json()
       if (!response.ok) throw new Error(payload.message || '동기화 상태를 확인하지 못했습니다.')
       setSyncProgress(payload.total ? `${payload.message} (${payload.fetched}/${payload.total})` : payload.message)
+      const elapsedSeconds = (Date.now() - new Date(payload.startedAt).getTime()) / 1000
+      const remainingSeconds = payload.total && payload.fetched ? (elapsedSeconds / payload.fetched) * (payload.total - payload.fetched) : 0
+      setSyncTiming(payload.total ? `경과 ${formatDuration(elapsedSeconds)} · 예상 남음 ${payload.fetched ? formatDuration(remainingSeconds) : '계산 중'}` : `경과 ${formatDuration(elapsedSeconds)}`)
       if (payload.status === 'completed') return payload.result
       if (payload.status === 'failed') throw new Error(payload.error || '동기화 중 오류가 발생했습니다.')
+      if (payload.status === 'cancelled') throw new Error('동기화가 취소되었습니다.')
       await new Promise((resolve) => window.setTimeout(resolve, 1000))
     }
   }
@@ -226,14 +282,11 @@ export default function App() {
   function selectProfile(next: Profile) {
     setProfileId(next.id)
     setLane(next.lane)
-    setChampionData([])
-    setSelectedId('')
-    setLiveData(false)
-    void refreshData(next)
+    void loadCachedData(next)
   }
 
   if (!profile) {
-    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>Riot ID, 태그, 기본 라인을 저장하면 선택 즉시 해당 계정의 이번 시즌 데이터를 동기화합니다.</p><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button></section>{isUserModalOpen && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}</main>
+    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.</p><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button></section>{isUserModalOpen && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}</main>
   }
 
   return (
@@ -249,11 +302,12 @@ export default function App() {
       <section className="hero" id="top">
         <div className="hero-copy"><p className="eyebrow"><Sparkles size={14} /> 개인 챔피언 분석</p><h1>내 플레이를 <em>이해하는</em><br />챔피언 기록</h1><p>챔피언 선택은 당신의 몫입니다. Chamlog는 선택한 챔피언의 숙련도와 개선점을 보여줍니다.</p></div>
         <div className="sync-card">
-          <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isSyncing ? '시즌 전적 동기화 중' : isLiveData ? 'Riot API 동기화 완료' : '동기화 대기'}</strong><small>{isSyncing ? syncProgress : `마지막 동기화: ${syncAge(profile.syncedAt)}`}</small></div>
-          <button className="refresh-button" disabled={isSyncing} onClick={() => void refreshData(profile)}>{isSyncing ? <RefreshCw className="spin" size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 중' : '데이터 새로고침'}</button>
+          <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isSyncing ? '시즌 전적 동기화 중' : isLiveData ? '저장된 분석 데이터' : '동기화 대기'}</strong><small>{isSyncing ? syncProgress : `마지막 동기화: ${syncAge(profile.syncedAt)}`}</small>{isSyncing && <small className="sync-timing">{syncTiming}</small>}</div>
+          <button className={`refresh-button ${isSyncing ? 'cancel-sync' : ''}`} onClick={() => isSyncing ? void cancelSync() : void refreshData(profile)}>{isSyncing ? <X size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 취소' : '데이터 새로고침'}</button>
         </div>
       </section>
       {syncError && <p className="sync-error"><CircleAlert size={15} /> {syncError}</p>}
+      {syncNotice && <p className="sync-notice"><Check size={15} /> {syncNotice}</p>}
       {profileError && <p className="sync-error"><CircleAlert size={15} /> {profileError}</p>}
 
       <section className="profile-bar">
@@ -274,13 +328,13 @@ export default function App() {
       <section className="workspace">
         <div className="champion-panel panel">
           <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">AI 숙련도순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
-          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? '공식 숙련도와 이번 시즌의 솔로·자유랭크 전체 게임을 분석한 데이터입니다. 메타·카운터는 아직 외부 데이터 연동 전입니다.' : '사용자를 선택하면 해당 계정의 이번 시즌 데이터를 자동으로 동기화합니다.'}</p>
+          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? '마지막 동기화 기준의 이번 시즌 솔로·자유랭크 분석 데이터입니다. 새 게임을 반영하려면 데이터 새로고침을 눌러주세요.' : '저장된 분석 데이터가 없습니다. 데이터 새로고침으로 첫 동기화를 진행하세요.'}</p>
           <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>AI 숙련도</span><span>최근 승률</span><span>메타</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
               <span className="champion-name"><img src={champion.image} alt="" /><b>{champion.name}</b></span>
               <span><b>{champion.masteryLevel}레벨</b><small>{formatMastery(champion.mastery)}점</small></span>
-              <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.aiScore ? champion.analysisNote ? '표본 적음' : '안정적' : '데이터 부족'}</small></span>
+              <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.analysisNote ? `표본 적음 · ${aiGrade(champion.aiScore)}` : aiGrade(champion.aiScore)}</small></span>
               <span><b>{champion.winRate ? `${champion.winRate}%` : '—'}</b><small>{champion.games}게임</small></span>
               <span className={tierClass(champion.tier)}>{champion.tier}</span>
             </button>)}
@@ -293,7 +347,7 @@ export default function App() {
           <DetailBlock icon={<Swords size={17} />} title="카운터"><div className="counter-grid"><CounterList label="상대하기 좋은 챔피언" values={selected.counters.good} type="good" /><CounterList label="상대하기 어려운 챔피언" values={selected.counters.difficult} type="difficult" /></div></DetailBlock>
           <DetailBlock icon={<Sparkles size={17} />} title="룬 정보"><div className="runes">{selected.runes.map((rune, index) => <span key={rune} className={index === 0 ? 'keystone' : ''}>{rune}</span>)}</div><small className="source-note">{isLiveData ? '최근 솔로·자유랭크 전적에서 가장 많이 사용한 룬입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small></DetailBlock>
           <DetailBlock icon={<Trophy size={17} />} title="공식 숙련도"><div className="mastery-stat"><div><strong>{selected.masteryLevel}</strong><span>레벨</span></div><div><b>{formatMastery(selected.mastery)}점</b><small>챔피언 숙련도 점수</small></div><div><b>{selected.games}회</b><small>{isLiveData ? '시즌 분석 게임' : '최근 분석 게임'}</small></div></div></DetailBlock>
-          <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{selected.aiScore && selected.aiScore >= 75 ? '안정적' : '보완 필요'}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
+          <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
             {selected.analysisNote && <p className="analysis-note"><CircleAlert size={13} /> {selected.analysisNote}</p>}
             <div className="insight-grid"><Insight title="강점" icon={<Check size={15} />} values={selected.strengths} tone="good" /><Insight title="개선할 점" icon={<Flame size={15} />} values={selected.improvements} tone="warn" /></div>
           </DetailBlock>
@@ -332,9 +386,13 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
   function saveForm() {
     if (!form.name.trim() || !form.riotId.trim() || !form.tag.trim()) return
     if (editingId === null) {
-      setRows((current) => [...current, { id: Date.now(), ...form, active: true, syncedAt: new Date() }])
+      setRows((current) => [...current, { id: Date.now(), ...form, active: true, syncedAt: new Date(0) }])
     } else {
-      setRows((current) => current.map((user) => user.id === editingId ? { ...user, ...form } : user))
+      setRows((current) => current.map((user) => {
+        if (user.id !== editingId) return user
+        const accountChanged = user.riotId.trim() !== form.riotId.trim() || user.tag.trim() !== form.tag.trim()
+        return accountChanged ? { ...user, ...form, puuid: undefined, syncedAt: new Date(0) } : { ...user, ...form }
+      }))
     }
     setForm({ name: '', riotId: '', tag: '', lane: 'MID' })
     setEditingId(null)

@@ -69,13 +69,17 @@ function saveUsers(users) {
 
 function createJob() {
   const id = crypto.randomUUID()
-  const job = { id, status: 'queued', message: '동기화 대기 중', fetched: 0, total: 0, result: null, error: null }
+  const job = { id, status: 'queued', message: '동기화 대기 중', fetched: 0, total: 0, result: null, error: null, cancelled: false, startedAt: new Date().toISOString(), completedAt: null }
   syncJobs.set(id, job)
   return job
 }
 
 function jobResponse(job) {
-  return { id: job.id, status: job.status, message: job.message, fetched: job.fetched, total: job.total, result: job.result, error: job.error }
+  return { id: job.id, status: job.status, message: job.message, fetched: job.fetched, total: job.total, result: job.result, error: job.error, startedAt: job.startedAt, completedAt: job.completedAt }
+}
+
+function ensureNotCancelled(job) {
+  if (job.cancelled) throw new RiotApiError(499, '동기화가 취소되었습니다.')
 }
 
 async function getChampionCatalog() {
@@ -101,6 +105,7 @@ const laneByTeamPosition = { TOP: 'TOP', JUNGLE: 'JUNGLE', MIDDLE: 'MID', BOTTOM
 const laneLabel = { TOP: '탑', JUNGLE: '정글', MID: '미드', BOTTOM: '원딜', SUPPORT: '서포터' }
 
 function clamp(value, min, max) { return Math.min(max, Math.max(min, value)) }
+function scoreBetween(value, low, high) { return clamp(((value - low) / (high - low)) * 100, 0, 100) }
 function daysAgo(timestamp) { return Math.max(0, Math.floor((Date.now() - timestamp) / 86400000)) }
 function lastPlayedLabel(timestamp) { const days = daysAgo(timestamp); return days === 0 ? '오늘' : `${days}일 전` }
 function asPercent(value) { return Math.round(value * 10) / 10 }
@@ -149,18 +154,53 @@ function buildChampionStats(matches, masteries, catalog) {
     const count = games.length
     const winRate = asPercent((entry.wins / count) * 100)
     const avg = (key) => games.reduce((total, game) => total + (game.participant[key] || 0), 0) / count
-    const avgKda = (avg('kills') + avg('assists')) / Math.max(avg('deaths'), 1)
-    const avgCs = (avg('totalMinionsKilled') + avg('neutralMinionsKilled')) / Math.max(games.reduce((total, game) => total + game.participant.timePlayed, 0) / count / 60, 1)
-    const avgVision = avg('visionScore')
-    const roleRaw = entry.lane === 'SUPPORT' ? (avgVision * 1.6 + avgKda * 8) : entry.lane === 'JUNGLE' ? (avgKda * 11 + avgCs * 7) : (avgKda * 10 + avgCs * 9)
-    const roleScore = clamp(roleRaw, 0, 100)
+    const avgChallenge = (key) => games.reduce((total, game) => total + (game.participant.challenges?.[key] || 0), 0) / count
+    const averageMinutes = Math.max(games.reduce((total, game) => total + game.participant.timePlayed, 0) / count / 60, 1)
+    const avgCsPerMinute = (avg('totalMinionsKilled') + avg('neutralMinionsKilled')) / averageMinutes
+    const avgDamagePerMinute = avgChallenge('damagePerMinute')
+    const avgGoldPerMinute = avgChallenge('goldPerMinute')
+    const avgKillParticipation = avgChallenge('killParticipation') * 100
+    const avgVisionPerMinute = avgChallenge('visionScorePerMinute') || avg('visionScore') / averageMinutes
+    const avgControlWards = avg('visionWardsBoughtInGame')
+    const avgJungleCsBefore10 = avgChallenge('jungleCsBefore10Minutes')
+
+    let roleScore = 0
+    let metrics = []
+    if (entry.lane === 'JUNGLE') {
+      const jungleFarmScore = scoreBetween(avgJungleCsBefore10, 10, 35)
+      const participationScore = scoreBetween(avgKillParticipation, 30, 75)
+      const combatScore = scoreBetween(avgDamagePerMinute, 250, 750)
+      roleScore = jungleFarmScore * .35 + participationScore * .4 + combatScore * .25
+      metrics = [
+        { label: '초반 정글링', value: avgJungleCsBefore10 >= 25 ? '상' : avgJungleCsBefore10 >= 17 ? '보통' : '보완 필요', tone: avgJungleCsBefore10 >= 25 ? 'good' : avgJungleCsBefore10 >= 17 ? 'neutral' : 'warn' },
+        { label: '킬 관여', value: avgKillParticipation >= 55 ? '상' : avgKillParticipation >= 40 ? '보통' : '보완 필요', tone: avgKillParticipation >= 55 ? 'good' : avgKillParticipation >= 40 ? 'neutral' : 'warn' },
+        { label: '교전 기여', value: avgDamagePerMinute >= 500 ? '양호' : '보완 필요', tone: avgDamagePerMinute >= 500 ? 'good' : 'warn' },
+      ]
+    } else if (entry.lane === 'SUPPORT') {
+      const visionScore = scoreBetween(avgVisionPerMinute, .6, 2.8)
+      const participationScore = scoreBetween(avgKillParticipation, 35, 80)
+      const wardScore = scoreBetween(avgControlWards, 2, 10)
+      roleScore = visionScore * .45 + participationScore * .35 + wardScore * .2
+      metrics = [
+        { label: '시야 관리', value: avgVisionPerMinute >= 1.8 ? '상' : avgVisionPerMinute >= 1.1 ? '보통' : '보완 필요', tone: avgVisionPerMinute >= 1.8 ? 'good' : avgVisionPerMinute >= 1.1 ? 'neutral' : 'warn' },
+        { label: '킬 관여', value: avgKillParticipation >= 60 ? '상' : avgKillParticipation >= 45 ? '보통' : '보완 필요', tone: avgKillParticipation >= 60 ? 'good' : avgKillParticipation >= 45 ? 'neutral' : 'warn' },
+        { label: '제어 와드', value: avgControlWards >= 5 ? '양호' : '보완 필요', tone: avgControlWards >= 5 ? 'good' : 'warn' },
+      ]
+    } else {
+      const csScore = scoreBetween(avgCsPerMinute, 4, 8)
+      const goldScore = scoreBetween(avgGoldPerMinute, 260, 480)
+      const combatScore = scoreBetween(avgDamagePerMinute, 280, 850)
+      roleScore = csScore * .4 + goldScore * .3 + combatScore * .3
+      metrics = [
+        { label: 'CS 수급', value: avgCsPerMinute >= 6.5 ? '상' : avgCsPerMinute >= 5 ? '보통' : '보완 필요', tone: avgCsPerMinute >= 6.5 ? 'good' : avgCsPerMinute >= 5 ? 'neutral' : 'warn' },
+        { label: '골드 수급', value: avgGoldPerMinute >= 390 ? '양호' : '보완 필요', tone: avgGoldPerMinute >= 390 ? 'good' : 'warn' },
+        { label: '전투 기여', value: avgDamagePerMinute >= 500 ? '양호' : '보완 필요', tone: avgDamagePerMinute >= 500 ? 'good' : 'warn' },
+      ]
+    }
     const frequency = clamp(count / 12, 0, 1) * 15
     const sample = clamp(count / 20, 0, 1) * 10
     const aiScore = count < 5 ? null : Math.round(roleScore * .5 + winRate * .2 + frequency + sample + 2.5)
     const mastery = masteryById.get(entry.championId)
-    const metrics = entry.lane === 'SUPPORT'
-      ? [{ label: '시야 관리', value: avgVision >= 45 ? '상' : avgVision >= 28 ? '보통' : '보완 필요', tone: avgVision >= 45 ? 'good' : avgVision >= 28 ? 'neutral' : 'warn' }, { label: '교전 기여', value: avgKda >= 3 ? '양호' : '보완 필요', tone: avgKda >= 3 ? 'good' : 'warn' }]
-      : [{ label: '전투 기여', value: avgKda >= 3 ? '상' : avgKda >= 2 ? '보통' : '보완 필요', tone: avgKda >= 3 ? 'good' : avgKda >= 2 ? 'neutral' : 'warn' }, { label: 'CS 수급', value: avgCs >= 6.5 ? '양호' : '보완 필요', tone: avgCs >= 6.5 ? 'good' : 'warn' }]
     return {
       id: catalogItem.id, entryId: `${catalogItem.id}:${entry.lane}`, name: catalogItem.name, lane: entry.lane,
       image: `${DDRAGON}/cdn/${catalog.version}/img/champion/${catalogItem.image.full}`,
@@ -197,6 +237,7 @@ async function collectSeasonMatchIds(puuid, startTime, job) {
   for (const queue of [420, 440]) {
     let start = 0
     while (true) {
+      ensureNotCancelled(job)
       job.message = `${queue === 420 ? '솔로랭크' : '자유랭크'} 시즌 매치 목록을 확인하는 중 (${start}개 조회)`
       const page = await riotFetch(`${ASIA}/lol/match/v5/matches/by-puuid/${puuid}/ids?queue=${queue}&startTime=${startTime}&start=${start}&count=100`)
       page.forEach((matchId) => ids.add(matchId))
@@ -230,6 +271,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     job.fetched = 0
     if (!missingIds.length) job.message = '저장된 시즌 전적을 분석하는 중'
     for (const matchId of missingIds) {
+      ensureNotCancelled(job)
       job.message = `시즌 게임 상세를 저장하는 중 (${job.fetched + 1}/${job.total})`
       const match = await riotFetch(`${ASIA}/lol/match/v5/matches/${matchId}`)
       player.matches[matchId] = match
@@ -253,12 +295,21 @@ async function runSeasonSync(job, gameName, tagLine) {
       matchCount: matches.length,
       seasonStart: new Date(startTime * 1000).toISOString(),
     }
+    player.summary = job.result
+    await saveCache(cache)
     job.status = 'completed'
     job.message = `이번 시즌 랭크 게임 ${matches.length}판 분석 완료`
+    job.completedAt = new Date().toISOString()
   } catch (error) {
-    job.status = 'failed'
-    job.error = error.message || '데이터를 동기화하지 못했습니다.'
-    job.message = '동기화에 실패했습니다.'
+    if (job.cancelled || error.status === 499) {
+      job.status = 'cancelled'
+      job.message = '동기화가 취소되었습니다. 저장된 게임은 다음 동기화 때 재사용됩니다.'
+    } else {
+      job.status = 'failed'
+      job.error = error.message || '데이터를 동기화하지 못했습니다.'
+      job.message = '동기화에 실패했습니다.'
+    }
+    job.completedAt = new Date().toISOString()
   }
 }
 
@@ -274,6 +325,23 @@ app.post('/api/riot/sync', (request, response) => {
 app.get('/api/riot/sync/:jobId', (request, response) => {
   const job = syncJobs.get(request.params.jobId)
   if (!job) return response.status(404).json({ message: '동기화 작업을 찾지 못했습니다.' })
+  response.json(jobResponse(job))
+})
+
+app.get('/api/riot/summary/:puuid', async (request, response) => {
+  const cache = await loadCache()
+  const summary = cache.players?.[request.params.puuid]?.summary
+  if (!summary) return response.status(404).json({ message: '저장된 분석 결과가 없습니다. 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' })
+  response.json(summary)
+})
+
+app.delete('/api/riot/sync/:jobId', (request, response) => {
+  const job = syncJobs.get(request.params.jobId)
+  if (!job) return response.status(404).json({ message: '동기화 작업을 찾지 못했습니다.' })
+  if (job.status === 'queued' || job.status === 'running') {
+    job.cancelled = true
+    job.message = '현재 요청을 마친 뒤 동기화를 취소하는 중'
+  }
   response.json(jobResponse(job))
 })
 
