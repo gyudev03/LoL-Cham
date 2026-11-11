@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -n api,web -c yellow,cyan \"npm:server\" \"npm:web\"",
+    "web": "vite",
+    "server": "node server/index.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -15,6 +17,10 @@
     "react-dom": "latest",
     "typescript": "latest",
     "vite": "latest"
+    ,"concurrently": "latest",
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest"
   },
   "devDependencies": {
     "@types/react": "^19.3.0",

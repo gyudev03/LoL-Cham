@@ -1,6 +1,6 @@
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import {
-  Check, ChevronDown, CircleAlert, Clock3, Flame, Gauge, Plus, RefreshCw,
+  Check, ChevronDown, CircleAlert, Flame, Gauge, Plus, RefreshCw,
   Search, Settings2, ShieldAlert, Sparkles, Swords, Trophy, Users, X,
 } from 'lucide-react'
 
@@ -21,7 +21,7 @@ type Champion = {
   name: string
   lane: Lane
   image: string
-  tier: 'S' | 'A' | 'B'
+  tier: 'S' | 'A' | 'B' | '—'
   mastery: number
   masteryLevel: number
   aiScore: number | null
@@ -41,7 +41,7 @@ const laneLabels: Record<Lane, string> = {
 
 const championImage = (id: string) => `https://ddragon.leagueoflegends.com/cdn/15.20.1/img/champion/${id}.png`
 
-const champions: Champion[] = [
+const mockChampions: Champion[] = [
   {
     id: 'Ahri', name: '아리', lane: 'MID', image: championImage('Ahri'), tier: 'A', mastery: 278450, masteryLevel: 7,
     aiScore: 78, winRate: 60, games: 20, lastPlayed: '7일 전', runes: ['감전', '궁극의 사냥꾼', '침착', '최후의 일격'],
@@ -114,29 +114,46 @@ export default function App() {
   const [profileId, setProfileId] = useState(1)
   const [lane, setLane] = useState<Lane>('MID')
   const [selectedId, setSelectedId] = useState('Ahri')
+  const [championData, setChampionData] = useState<Champion[]>(mockChampions)
   const [sortBy, setSortBy] = useState<'ai' | 'mastery' | 'win'>('ai')
   const [isUserModalOpen, setUserModalOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState('')
+  const [isLiveData, setLiveData] = useState(false)
   const [query, setQuery] = useState('')
   const profile = profiles.find((item) => item.id === profileId)!
-  const selected = champions.find((item) => item.id === selectedId)!
+  const selected = championData.find((item) => item.id === selectedId) ?? championData[0] ?? mockChampions[0]
 
-  const laneChampions = useMemo(() => champions
+  const laneChampions = useMemo(() => championData
     .filter((champion) => champion.lane === lane && champion.name.includes(query.trim()))
     .sort((a, b) => sortBy === 'mastery' ? b.mastery - a.mastery : sortBy === 'win' ? (b.winRate ?? 0) - (a.winRate ?? 0) : (b.aiScore ?? 0) - (a.aiScore ?? 0)), [lane, query, sortBy])
 
   function switchLane(nextLane: Lane) {
     setLane(nextLane)
-    const first = champions.find((champion) => champion.lane === nextLane)
+    const first = championData.find((champion) => champion.lane === nextLane)
     if (first) setSelectedId(first.id)
   }
 
-  function refreshData() {
+  async function refreshData() {
     setSyncing(true)
-    window.setTimeout(() => {
-      setProfiles((current) => current.map((item) => item.id === profileId ? { ...item, syncedAt: new Date() } : item))
+    setSyncError('')
+    try {
+      const params = new URLSearchParams({ gameName: profile.riotId, tagLine: profile.tag })
+      const response = await fetch(`/api/riot/sync?${params}`)
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.message || '동기화 중 오류가 발생했습니다.')
+      if (!payload.champions.length) throw new Error('최근 30게임에서 분석 가능한 솔로·자유랭크 전적을 찾지 못했습니다.')
+      setChampionData(payload.champions)
+      setLiveData(true)
+      setProfiles((current) => current.map((item) => item.id === profileId ? { ...item, riotId: payload.account.gameName, tag: payload.account.tagLine, syncedAt: new Date(payload.syncedAt) } : item))
+      const preferred = payload.champions.find((champion: Champion) => champion.lane === lane) ?? payload.champions[0]
+      setLane(preferred.lane)
+      setSelectedId(preferred.id)
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.')
+    } finally {
       setSyncing(false)
-    }, 1000)
+    }
   }
 
   return (
@@ -152,10 +169,11 @@ export default function App() {
       <section className="hero" id="top">
         <div className="hero-copy"><p className="eyebrow"><Sparkles size={14} /> 개인 챔피언 분석</p><h1>내 플레이를 <em>이해하는</em><br />챔피언 기록</h1><p>챔피언 선택은 당신의 몫입니다. Chamlog는 선택한 챔피언의 숙련도와 개선점을 보여줍니다.</p></div>
         <div className="sync-card">
-          <div><p>데이터 상태</p><strong><span className="status-dot" /> 동기화 완료</strong><small>마지막 동기화: {syncAge(profile.syncedAt)}</small></div>
+          <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isLiveData ? 'Riot API 동기화 완료' : '예시 데이터'}</strong><small>마지막 동기화: {syncAge(profile.syncedAt)}</small></div>
           <button className="refresh-button" disabled={isSyncing} onClick={refreshData}>{isSyncing ? <RefreshCw className="spin" size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 중' : '데이터 새로고침'}</button>
         </div>
       </section>
+      {syncError && <p className="sync-error"><CircleAlert size={15} /> {syncError}</p>}
 
       <section className="profile-bar">
         <div className="profile-select-wrap">
@@ -175,7 +193,7 @@ export default function App() {
       <section className="workspace">
         <div className="champion-panel panel">
           <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">AI 숙련도순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
-          <p className="data-notice"><CircleAlert size={14} /> 현재 분석 값은 화면 검증용 예시 데이터입니다.</p>
+          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? '공식 숙련도와 최근 솔로·자유랭크 30게임으로 분석한 데이터입니다. 메타·카운터·룬은 아직 외부 데이터 연동 전입니다.' : '현재 분석 값은 화면 검증용 예시 데이터입니다. Riot API 키 설정 후 새로고침하면 실제 데이터로 바뀝니다.'}</p>
           <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>AI 숙련도</span><span>최근 승률</span><span>메타</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={champion.id} className={`champion-row ${selectedId === champion.id ? 'selected' : ''}`} onClick={() => setSelectedId(champion.id)}>
