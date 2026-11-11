@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth'
-import { collection, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
 import {
   Check, ChevronDown, CircleAlert, Flame, Gauge, Plus, RefreshCw,
-  Pencil, Search, Settings2, ShieldAlert, Sparkles, Swords, Trophy, Users, X, LogIn, LogOut, Upload,
+  Pencil, Search, Settings2, ShieldAlert, Sparkles, Swords, Trash2, Trophy, Users, X, LogIn, LogOut, Upload,
 } from 'lucide-react'
 import { auth, db, googleProvider } from './firebase'
 
@@ -327,10 +327,25 @@ export default function App() {
 
   async function saveUserProfiles(nextProfiles: Profile[]) {
     setProfileError('')
+    const removed = profiles.filter((item) => !nextProfiles.some((next) => next.id === item.id))
     await persistProfiles(nextProfiles)
+    // 삭제된 사용자의 공용 프로필과 분석 결과를 Firebase에서 함께 제거한다. 관리자 PC의 로컬 캐시(data/)는 건드리지 않는다.
+    await Promise.all(removed.flatMap((item) => [deleteDoc(doc(sharedProfiles, String(item.id))), deleteDoc(summaryRef(item.id))]))
+    if (removed.length && hasSyncServer) {
+      // 로컬 서버의 users.json 목록도 맞춰 두어, 공용 데이터가 비었을 때 삭제한 사용자가 다시 나타나지 않게 한다.
+      await fetch(`${syncApiBase}/users`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ users: nextProfiles.map(profileForStorage) }) }).catch(() => undefined)
+    }
     setProfiles(nextProfiles)
     const nextActive = nextProfiles.find((item) => item.id === profileId && item.active) ?? nextProfiles.find((item) => item.active)
     if (nextActive) { setProfileId(nextActive.id); setLane(nextActive.lane); void loadCachedData(nextActive) }
+    else if (removed.some((item) => item.id === profileId)) {
+      setProfileId(null)
+      setChampionData([])
+      setSelectedId('')
+      setLiveData(false)
+      setSharedData(false)
+      setLocalOnlyData(false)
+    }
     setUserModalOpen(false)
   }
 
@@ -503,6 +518,12 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
   const [form, setForm] = useState({ name: '', riotId: '', tag: '', lane: 'MID' as Lane })
   const [isSaving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  function removeUser(id: number) {
+    setRows((current) => current.filter((user) => user.id !== id))
+    setConfirmDeleteId(null)
+    if (editingId === id) { setAdding(false); setEditingId(null); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }
+  }
   function startEdit(user: Profile) {
     setForm({ name: user.name, riotId: user.riotId, tag: user.tag, lane: user.lane })
     setEditingId(user.id)
@@ -528,8 +549,8 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     setSaveError('')
     try { await onSave(rows) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
   }
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다.</p>
-    <div className="user-rows">{rows.map((user) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button></div>)}</div>
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다. 삭제한 사용자는 &lsquo;변경사항 저장&rsquo;을 누르면 공용 분석 데이터까지 함께 지워지며 되돌릴 수 없습니다. 잠시 숨기려면 삭제 대신 비활성으로 바꾸세요.</p>
+    <div className="user-rows">{rows.map((user) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button>{confirmDeleteId === user.id ? <><button className="user-delete confirm" onClick={() => removeUser(user.id)} disabled={isSaving}>삭제 확인</button><button className="user-edit" onClick={() => setConfirmDeleteId(null)} disabled={isSaving}>취소</button></> : <button className="user-delete" onClick={() => setConfirmDeleteId(user.id)} disabled={isSaving} aria-label={`${user.name} 삭제`}><Trash2 size={14} /> 삭제</button>}</div>)}</div>
     {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><input placeholder="Riot ID" value={form.riotId} onChange={(e) => setForm({ ...form, riotId: e.target.value })} /><input placeholder="태그 (예: KR1)" value={form.tag} onChange={(e) => setForm({ ...form, tag: e.target.value })} /><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
     {saveError && <p className="modal-error"><CircleAlert size={14} /> {saveError}</p>}
     <div className="modal-actions"><button className="ghost-button" onClick={onClose} disabled={isSaving}>취소</button><button className="primary-button" onClick={save} disabled={isSaving}>{isSaving ? '저장 중' : '변경사항 저장'}</button></div>
