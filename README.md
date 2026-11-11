@@ -20,6 +20,18 @@ npm run dev
 
 `RIOT_API_KEY`는 서버만 읽습니다. 키를 `VITE_` 환경 변수로 만들거나 Git에 커밋하면 안 됩니다.
 
+## GitHub Pages 공용 데이터와 관리자
+
+GitHub Pages는 화면만 제공하므로 공용 사용자·챔피언 분석 결과는 Firebase Firestore에 저장한다. 페이지 방문자는 로그인 없이 마지막으로 공유된 데이터를 읽을 수 있다.
+
+- `shared/chamlog/profiles/{profileId}`: 공용 사용자 설정
+- `shared/chamlog/summaries/{profileId}`: 화면 표시용 챔피언 분석 결과
+- `admins/{Firebase UID}`: `enabled: true`인 Google 계정만 수정 및 동기화 결과 저장 가능
+
+Google 로그인은 열람용이 아니라 관리자 권한 확인에만 사용한다. Firestore 규칙에서 공용 데이터 읽기는 허용하고 쓰기는 `admins/{uid}`의 `enabled: true`만 허용해야 한다. Firebase 웹 설정값은 앱 식별 설정이므로 소스에 포함되지만, Riot API 키와 Firebase 서비스 계정 키는 절대 포함하면 안 된다.
+
+기존 PC의 로컬 캐시 결과를 처음 옮길 때는 관리자 로그인 후 `공용 데이터로 저장`을 누른다. 이후 다른 기기에서는 GitHub Pages로 같은 데이터를 조회할 수 있다. 새 Riot 전적 동기화는 Riot 키가 있는 로컬 서버에서 수행하고, 결과가 Firestore로 저장될 때 공유 화면에 반영된다.
+
 ## 개인용 상시 배포 (Render)
 
 PC에서 `npm run dev`를 실행하지 않고 접속하려면 Render에 배포합니다. 저장 데이터가 유지되어야 하므로 무료·임시 파일 시스템 배포는 사용하지 않습니다.

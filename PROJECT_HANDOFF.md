@@ -98,6 +98,8 @@ AI 숙련도는 챔피언 추천 점수가 아니다. 해당 사용자가 그 �
 - 예시 사용자·챔피언 데이터 제거: 사용자가 없으면 등록 화면을 표시하고, 선택 사용자 데이터만 화면에 표시
 - 사용자 선택 시 저장된 마지막 분석 결과 표시, 사용자 수동 새로고침 시에만 시즌 동기화
 - 사용자 정보를 서버 로컬 파일에 저장
+- GitHub Pages 공용 열람 데이터는 Firebase Firestore에 저장한다. 사용자·챔피언 분석 결과는 `shared/chamlog` 하위 컬렉션으로 분리한다.
+- 일반 방문자는 Firebase 로그인 없이 공용 데이터를 읽는다. Google 로그인 후 `admins/{uid}` 문서의 `enabled: true`가 확인된 관리자만 사용자 수정·공유 결과 저장·동기화 UI를 사용할 수 있다.
 - 배포 모드에서는 Express가 `dist/`의 웹 화면과 API를 같은 도메인에서 제공한다. `DATA_DIR` 환경 변수로 영속 디스크 경로를 지정할 수 있다.
 - `APP_PASSWORD`가 설정되면 웹 화면과 API에 HTTP Basic Auth를 적용한다. `NODE_ENV=production`에서는 비밀번호 없이 서버가 시작되지 않는다.
 - 라인 탭: 탑, 정글, 미드, 원딜, 서포터
@@ -246,6 +248,15 @@ node --check server/index.mjs
 - `NODE_ENV=production`일 때 `APP_PASSWORD`가 비어 있으면 서버는 시작하지 않는다.
 - `render.yaml`은 Render Singapore 리전, 1GB 영속 디스크, `npm ci && npm run build` 빌드, `npm start` 실행을 정의한다.
 - 배포 URL이 있어도 Riot API 키와 개인 전적이 노출되지 않도록 저장소는 비공개로 유지하고 `.env`, `data/`를 푸시하지 않는다.
+
+### Firebase 공용 데이터
+
+- 설정 파일: `src/firebase.ts`. Firebase 웹 설정값은 공개 클라이언트 식별자이며 Riot API 키 또는 Firebase 서비스 계정 키가 아니다.
+- `shared/chamlog/profiles/{profileId}`: 표시 이름, Riot ID, 태그, 기본 라인, PUUID, 마지막 동기화 시각.
+- `shared/chamlog/summaries/{profileId}`: 화면에 쓰는 챔피언 분석 결과만 저장한다. 수십 MB가 될 수 있는 원본 Match-V5 캐시는 Firestore에 올리지 않는다.
+- `admins/{uid}`: Firebase Authentication Google 로그인 뒤 권한을 판단하는 문서. Firebase 콘솔에서 각 관리자 UID 문서를 만들고 `enabled: true`를 설정한다.
+- 공개 Firestore 규칙은 공용 데이터의 읽기만 누구에게나 허용하고, 공용 데이터 쓰기는 `admins/{uid}.enabled == true`만 허용해야 한다. `admins` 쓰기는 클라이언트에서 차단한다.
+- GitHub Pages 관리자는 `gyudev03.github.io`를 Firebase Authentication의 승인된 도메인에 등록해야 한다.
 
 ## 7. Riot API 동기화 상세
 

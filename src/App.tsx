@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth'
+import { collection, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
 import {
   Check, ChevronDown, CircleAlert, Flame, Gauge, Plus, RefreshCw,
-  Pencil, Search, Settings2, ShieldAlert, Sparkles, Swords, Trophy, Users, X,
+  Pencil, Search, Settings2, ShieldAlert, Sparkles, Swords, Trophy, Users, X, LogIn, LogOut, Upload,
 } from 'lucide-react'
+import { auth, db, googleProvider } from './firebase'
 
 type Lane = 'TOP' | 'JUNGLE' | 'MID' | 'BOTTOM' | 'SUPPORT'
 
@@ -47,6 +50,17 @@ type Champion = {
   improvements: string[]
   metrics: { label: string; value: string; tone: 'good' | 'neutral' | 'warn' }[]
 }
+
+type SyncResult = {
+  champions: Champion[]
+  account: { puuid: string; gameName: string; tagLine: string }
+  syncedAt: string
+}
+
+const sharedProfiles = collection(db, 'shared', 'chamlog', 'profiles')
+const summaryRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', String(profileId))
+const syncApiBase = import.meta.env.VITE_SYNC_API_URL || '/api'
+const hasSyncServer = window.location.hostname === 'localhost' || Boolean(import.meta.env.VITE_SYNC_API_URL)
 
 const laneLabels: Record<Lane, string> = {
   TOP: '탑', JUNGLE: '정글', MID: '미드', BOTTOM: '원딜', SUPPORT: '서포터',
@@ -136,6 +150,14 @@ function aiGrade(score: number | null) {
   return '보완 필요'
 }
 
+function profileFromStorage(item: Omit<Profile, 'syncedAt'> & { syncedAt?: string | Date }) {
+  return { ...item, syncedAt: item.syncedAt ? new Date(item.syncedAt) : new Date(0) }
+}
+
+function profileForStorage(item: Profile) {
+  return { ...item, syncedAt: item.syncedAt.toISOString() }
+}
+
 export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [profileId, setProfileId] = useState<number | null>(null)
@@ -152,18 +174,42 @@ export default function App() {
   const [syncNotice, setSyncNotice] = useState('')
   const [profileError, setProfileError] = useState('')
   const [isLiveData, setLiveData] = useState(false)
+  const [isSharedData, setSharedData] = useState(false)
+  const [hasLocalOnlyData, setLocalOnlyData] = useState(false)
+  const [authUser, setAuthUser] = useState<User | null>(null)
+  const [isAdmin, setAdmin] = useState(false)
+  const [authBusy, setAuthBusy] = useState(false)
   const [query, setQuery] = useState('')
   const profile = profiles.find((item) => item.id === profileId)
   const selected = championData.find((item) => championEntryId(item) === selectedId) ?? championData[0]
 
+  useEffect(() => onAuthStateChanged(auth, async (user) => {
+    setAuthUser(user)
+    if (!user) { setAdmin(false); return }
+    try {
+      const admin = await getDoc(doc(db, 'admins', user.uid))
+      const allowed = admin.exists() && admin.data().enabled === true
+      setAdmin(allowed)
+      if (!allowed) setProfileError(`관리자 권한이 없습니다. Firebase Console의 admins/${user.uid} 문서에 enabled: true를 등록하세요.`)
+    } catch {
+      setAdmin(false)
+    }
+  }), [])
+
   useEffect(() => {
     async function loadProfiles() {
       try {
-        const response = await fetch('/api/users')
-        const payload = await response.json()
-        if (!response.ok) throw new Error(payload.message || '저장된 사용자 정보를 불러오지 못했습니다.')
-        if (!Array.isArray(payload.users) || payload.users.length === 0) return
-        const savedProfiles = payload.users.map((item: Omit<Profile, 'syncedAt'> & { syncedAt?: string }) => ({ ...item, syncedAt: item.syncedAt ? new Date(item.syncedAt) : new Date(0) }))
+        const sharedSnapshot = await getDocs(sharedProfiles)
+        let savedProfiles = sharedSnapshot.docs.map((item) => profileFromStorage(item.data() as Omit<Profile, 'syncedAt'> & { syncedAt?: string | Date }))
+        if (savedProfiles.length) setSharedData(true)
+        if (!savedProfiles.length) {
+          const response = await fetch(`${syncApiBase}/users`)
+          const payload = await response.json()
+          if (!response.ok) throw new Error(payload.message || '저장된 사용자 정보를 불러오지 못했습니다.')
+          savedProfiles = Array.isArray(payload.users) ? payload.users.map(profileFromStorage) : []
+          setSharedData(false)
+        }
+        if (!savedProfiles.length) return
         setProfiles(savedProfiles)
         const active = savedProfiles.find((item: Profile) => item.active) ?? savedProfiles[0]
         setProfileId(active.id)
@@ -191,13 +237,22 @@ export default function App() {
     setChampionData([])
     setSelectedId('')
     setLiveData(false)
-    if (!targetProfile.puuid) return
     try {
-      const response = await fetch(`/api/riot/summary/${encodeURIComponent(targetProfile.puuid)}`)
-      if (response.status === 404) return
-      const payload = await response.json()
-      if (!response.ok) throw new Error(payload.message || '저장된 분석 데이터를 불러오지 못했습니다.')
-      if (!payload.champions?.length) return
+      const sharedSummary = await getDoc(summaryRef(targetProfile.id))
+      let payload = sharedSummary.exists() ? sharedSummary.data() as SyncResult : null
+      setSharedData(sharedSummary.exists())
+      setLocalOnlyData(false)
+      if (!payload && targetProfile.puuid) {
+        const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(targetProfile.puuid)}`)
+        if (response.ok) {
+          payload = await response.json() as SyncResult
+          setLocalOnlyData(true)
+        } else if (response.status !== 404) {
+          const body = await response.json().catch(() => ({}))
+          throw new Error(body.message || '저장된 분석 데이터를 불러오지 못했습니다.')
+        }
+      }
+      if (!payload?.champions?.length) return
       setChampionData(payload.champions)
       setLiveData(true)
       const preferred = payload.champions.find((champion: Champion) => champion.lane === targetProfile.lane) ?? payload.champions[0]
@@ -210,13 +265,21 @@ export default function App() {
 
   async function refreshData(targetProfile = profile) {
     if (!targetProfile) return
+    if (!isAdmin) {
+      setSyncError('데이터 동기화는 관리자 Google 로그인 후에만 할 수 있습니다.')
+      return
+    }
+    if (!hasSyncServer) {
+      setSyncError('GitHub Pages에는 Riot 동기화 서버가 없습니다. 관리자 PC에서 로컬 동기화 도구를 실행한 뒤 결과를 공용 데이터로 저장하세요.')
+      return
+    }
     setSyncing(true)
     setSyncError('')
     setSyncNotice('')
     setSyncProgress('동기화 작업을 시작하는 중')
     setSyncTiming('')
     try {
-      const response = await fetch('/api/riot/sync', {
+      const response = await fetch(`${syncApiBase}/riot/sync`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ gameName: targetProfile.riotId, tagLine: targetProfile.tag }),
       })
@@ -229,7 +292,10 @@ export default function App() {
       setLiveData(true)
       setProfiles((current) => {
         const nextProfiles = current.map((item) => item.id === targetProfile.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) } : item)
-        void persistProfiles(nextProfiles).catch((error) => setProfileError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.'))
+        void persistProfiles(nextProfiles)
+          .then(() => setDoc(summaryRef(targetProfile.id), result))
+          .then(() => { setSharedData(true); setLocalOnlyData(false) })
+          .catch((error) => setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.'))
         return nextProfiles
       })
       const preferred = result.champions.find((champion: Champion) => champion.lane === lane) ?? result.champions[0]
@@ -250,18 +316,13 @@ export default function App() {
   async function cancelSync() {
     if (!syncJobId) return
     setSyncProgress('동기화 취소를 요청하는 중')
-    await fetch(`/api/riot/sync/${syncJobId}`, { method: 'DELETE' })
+    await fetch(`${syncApiBase}/riot/sync/${syncJobId}`, { method: 'DELETE' })
   }
 
   async function persistProfiles(nextProfiles: Profile[]) {
-    const response = await fetch('/api/users', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ users: nextProfiles.map((item) => ({ ...item, syncedAt: item.syncedAt.toISOString() })) }),
-    })
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}))
-      throw new Error(payload.message || '사용자 정보를 저장하지 못했습니다.')
-    }
+    if (!isAdmin) throw new Error('사용자 정보 수정은 관리자만 할 수 있습니다.')
+    await Promise.all(nextProfiles.map((item) => setDoc(doc(sharedProfiles, String(item.id)), profileForStorage(item))))
+    setSharedData(true)
   }
 
   async function saveUserProfiles(nextProfiles: Profile[]) {
@@ -273,9 +334,43 @@ export default function App() {
     setUserModalOpen(false)
   }
 
+  async function publishLocalData() {
+    if (!profile || !isAdmin || !championData.length) return
+    try {
+      await persistProfiles(profiles)
+      await setDoc(summaryRef(profile.id), {
+        account: { puuid: profile.puuid || '', gameName: profile.riotId, tagLine: profile.tag },
+        champions: championData,
+        syncedAt: profile.syncedAt.toISOString(),
+      })
+      setSharedData(true)
+      setLocalOnlyData(false)
+      setSyncNotice('현재 PC의 분석 결과를 공용 Firebase 데이터로 저장했습니다.')
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.')
+    }
+  }
+
+  async function signInAsManager() {
+    setAuthBusy(true)
+    setProfileError('')
+    try {
+      await signInWithPopup(auth, googleProvider)
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : 'Google 로그인에 실패했습니다.')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function signOutManager() {
+    await signOut(auth)
+    setAdmin(false)
+  }
+
   async function waitForSync(jobId: string): Promise<{ champions: Champion[]; account: { puuid: string; gameName: string; tagLine: string }; syncedAt: string }> {
     while (true) {
-      const response = await fetch(`/api/riot/sync/${jobId}`)
+      const response = await fetch(`${syncApiBase}/riot/sync/${jobId}`)
       const payload = await response.json()
       if (!response.ok) throw new Error(payload.message || '동기화 상태를 확인하지 못했습니다.')
       setSyncProgress(payload.total ? `${payload.message} (${payload.fetched}/${payload.total})` : payload.message)
@@ -296,7 +391,7 @@ export default function App() {
   }
 
   if (!profile) {
-    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.</p><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button></section>{isUserModalOpen && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}</main>
+    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}</main>
   }
 
   return (
@@ -304,8 +399,8 @@ export default function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Chamlog 홈"><span>CHAM</span>LOG <i /></a>
         <div className="header-actions">
-          <button className="ghost-button" onClick={() => setUserModalOpen(true)}><Users size={17} /> 사용자 관리</button>
-          <button className="avatar" onClick={() => setUserModalOpen(true)} aria-label="사용자 설정">홍</button>
+          {isAdmin && <button className="ghost-button" onClick={() => setUserModalOpen(true)}><Users size={17} /> 사용자 관리</button>}
+          <ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} />
         </div>
       </header>
 
@@ -313,7 +408,7 @@ export default function App() {
         <div className="hero-copy"><p className="eyebrow"><Sparkles size={14} /> 개인 챔피언 분석</p><h1>내 플레이를 <em>이해하는</em><br />챔피언 기록</h1><p>챔피언 선택은 당신의 몫입니다. Chamlog는 선택한 챔피언의 숙련도와 개선점을 보여줍니다.</p></div>
         <div className="sync-card">
           <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isSyncing ? '시즌 전적 동기화 중' : isLiveData ? '저장된 분석 데이터' : '동기화 대기'}</strong><small>{isSyncing ? syncProgress : `마지막 동기화: ${syncAge(profile.syncedAt)}`}</small>{isSyncing && <small className="sync-timing">{syncTiming}</small>}</div>
-          <button className={`refresh-button ${isSyncing ? 'cancel-sync' : ''}`} onClick={() => isSyncing ? void cancelSync() : void refreshData(profile)}>{isSyncing ? <X size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 취소' : '데이터 새로고침'}</button>
+          {hasLocalOnlyData && isAdmin ? <button className="refresh-button" onClick={() => void publishLocalData()}><Upload size={16} /> 공용 데이터로 저장</button> : isAdmin && hasSyncServer ? <button className={`refresh-button ${isSyncing ? 'cancel-sync' : ''}`} onClick={() => isSyncing ? void cancelSync() : void refreshData(profile)}>{isSyncing ? <X size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 취소' : '데이터 새로고침'}</button> : isAdmin ? <button className="refresh-button" disabled title="관리자 PC의 로컬 동기화 도구가 필요합니다."><RefreshCw size={16} /> 로컬 동기화 필요</button> : <button className="refresh-button" disabled title="관리자만 동기화할 수 있습니다."><RefreshCw size={16} /> 관리자 전용</button>}
         </div>
       </section>
       {syncError && <p className="sync-error"><CircleAlert size={15} /> {syncError}</p>}
@@ -328,7 +423,7 @@ export default function App() {
           </select><ChevronDown size={16} /></div>
         </div>
         <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div><strong>{profile.riotId}<span>#{profile.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></div></div>
-        <button className="profile-edit" onClick={() => setUserModalOpen(true)}><Settings2 size={16} /> 사용자 정보 관리</button>
+        {isAdmin && <button className="profile-edit" onClick={() => setUserModalOpen(true)}><Settings2 size={16} /> 사용자 정보 관리</button>}
       </section>
 
       <nav className="lane-tabs" aria-label="라인 선택">
@@ -338,7 +433,7 @@ export default function App() {
       <section className="workspace">
         <div className="champion-panel panel">
           <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">AI 숙련도순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
-          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? '마지막 동기화 기준의 이번 시즌 솔로·자유랭크 분석 데이터입니다. 새 게임을 반영하려면 데이터 새로고침을 눌러주세요.' : '저장된 분석 데이터가 없습니다. 데이터 새로고침으로 첫 동기화를 진행하세요.'}</p>
+          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
           <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>AI 숙련도</span><span>최근 승률</span><span>메타</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
@@ -367,9 +462,15 @@ export default function App() {
         </aside> : <aside className="detail-panel panel detail-empty"><Gauge size={28} /><h2>{isSyncing ? '시즌 전적을 분석하고 있습니다' : '챔피언을 기다리고 있습니다'}</h2><p>{isSyncing ? '동기화가 끝나면 실제 플레이한 챔피언이 표시됩니다.' : '새로고침으로 해당 사용자의 챔피언 데이터를 불러오세요.'}</p></aside>}
       </section>
 
-      {isUserModalOpen && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}
+      {isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}
     </main>
   )
+}
+
+function ManagerButton({ user, isAdmin, busy, onSignIn, onSignOut }: { user: User | null; isAdmin: boolean; busy: boolean; onSignIn: () => Promise<void>; onSignOut: () => Promise<void> }) {
+  if (!user) return <button className="ghost-button" disabled={busy} onClick={() => void onSignIn()}><LogIn size={16} /> {busy ? '로그인 중' : '관리자 로그인'}</button>
+  if (!isAdmin) return <button className="ghost-button" onClick={() => void onSignOut()} title={user.email || undefined}><ShieldAlert size={16} /> 권한 없음</button>
+  return <button className="ghost-button manager-account" onClick={() => void onSignOut()} title="로그아웃"><Check size={16} /> 관리자 <LogOut size={14} /></button>
 }
 
 function DetailBlock({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {

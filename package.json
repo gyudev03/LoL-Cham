@@ -19,6 +19,7 @@
     "cors": "latest",
     "dotenv": "latest",
     "express": "latest",
+    "firebase": "^13.2.0",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
