@@ -31,7 +31,17 @@ type Champion = {
   games: number
   lastPlayed: string
   analysisNote?: string
-  runes: string[]
+  runes?: string[]
+  runeInfo?: {
+    primaryTree: string
+    primaryRunes: string[]
+    secondaryTree: string | null
+    secondaryRunes: string[]
+    shards: string[]
+    games: number
+    pickRate: number
+    winRate: number
+  } | null
   counters: { good: string[]; difficult: string[] }
   strengths: string[]
   improvements: string[]
@@ -345,7 +355,10 @@ export default function App() {
         {selected ? <aside className="detail-panel panel">
           <div className="detail-title"><img src={selected.image} alt="" /><div><p className="eyebrow">{laneLabels[selected.lane]}</p><h2>{selected.name}</h2></div><span className={tierClass(selected.tier)}>{selected.tier}<small>메타 티어</small></span></div>
           <DetailBlock icon={<Swords size={17} />} title="카운터"><div className="counter-grid"><CounterList label="상대하기 좋은 챔피언" values={selected.counters.good} type="good" /><CounterList label="상대하기 어려운 챔피언" values={selected.counters.difficult} type="difficult" /></div></DetailBlock>
-          <DetailBlock icon={<Sparkles size={17} />} title="룬 정보"><div className="runes">{selected.runes.map((rune, index) => <span key={rune} className={index === 0 ? 'keystone' : ''}>{rune}</span>)}</div><small className="source-note">{isLiveData ? '최근 솔로·자유랭크 전적에서 가장 많이 사용한 룬입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small></DetailBlock>
+          <DetailBlock icon={<Sparkles size={17} />} title="룬 정보">
+            {selected.runeInfo ? <RuneInfo info={selected.runeInfo} /> : <div className="runes">{(selected.runes || ['룬 정보를 찾지 못했습니다.']).map((rune, index) => <span key={rune} className={index === 0 ? 'keystone' : ''}>{rune}</span>)}</div>}
+            <small className="source-note">{isLiveData ? '이번 시즌 해당 라인에서 가장 많이 사용한 룬 조합입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small>
+          </DetailBlock>
           <DetailBlock icon={<Trophy size={17} />} title="공식 숙련도"><div className="mastery-stat"><div><strong>{selected.masteryLevel}</strong><span>레벨</span></div><div><b>{formatMastery(selected.mastery)}점</b><small>챔피언 숙련도 점수</small></div><div><b>{selected.games}회</b><small>{isLiveData ? '시즌 분석 게임' : '최근 분석 게임'}</small></div></div></DetailBlock>
           <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
             {selected.analysisNote && <p className="analysis-note"><CircleAlert size={13} /> {selected.analysisNote}</p>}
@@ -365,6 +378,17 @@ function DetailBlock({ icon, title, children }: { icon: ReactNode; title: string
 
 function CounterList({ label, values, type }: { label: string; values: string[]; type: 'good' | 'difficult' }) {
   return <div className={`counter-list ${type}`}><small>{type === 'good' ? <Check size={13} /> : <ShieldAlert size={13} />}{label}</small><div>{values.map((name) => <span key={name}>{name}</span>)}</div></div>
+}
+
+function RuneInfo({ info }: { info: NonNullable<Champion['runeInfo']> }) {
+  return <div className="rune-info">
+    <div className="rune-usage"><b>{info.games}게임 사용 · {info.pickRate}%</b><span>해당 조합 승률 {info.winRate}%</span></div>
+    <div className="rune-paths">
+      <div className="rune-path primary"><small>주 룬 · {info.primaryTree}</small><div>{info.primaryRunes.map((rune, index) => <span key={rune} className={index === 0 ? 'keystone' : ''}>{rune}</span>)}</div></div>
+      {info.secondaryTree && <div className="rune-path"><small>보조 룬 · {info.secondaryTree}</small><div>{info.secondaryRunes.map((rune) => <span key={rune}>{rune}</span>)}</div></div>}
+    </div>
+    {info.shards.length > 0 && <div className="rune-shards"><small>능력치 파편</small><span>{info.shards.join(' · ')}</span></div>}
+  </div>
 }
 
 function Insight({ title, icon, values, tone }: { title: string; icon: ReactNode; values: string[]; tone: 'good' | 'warn' }) {

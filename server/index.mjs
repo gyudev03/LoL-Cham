@@ -115,21 +115,50 @@ function seasonStartSeconds() {
   const date = /^\d{4}-\d{2}-\d{2}$/.test(configured || '') ? `${configured}T00:00:00+09:00` : `${year}-01-08T12:00:00+09:00`
   return Math.floor(new Date(date).getTime() / 1000)
 }
-function participantRunes(participant, runeById) {
-  const selected = participant.perks?.styles?.flatMap((style) => style.selections.map((selection) => selection.perk)) || []
-  return selected.map((id) => runeById.get(id)).filter(Boolean)
+const statShardById = {
+  5001: '체력', 5002: '이동 속도', 5003: '체력 증가', 5005: '공격 속도',
+  5007: '스킬 가속', 5008: '적응형 능력치', 5010: '강인함·둔화 저항', 5011: '체력 증가',
 }
+
+function participantRuneConfiguration(participant, runeById) {
+  const styles = participant.perks?.styles || []
+  const primary = styles.find((style) => style.description === 'primaryStyle') || styles[0]
+  const secondary = styles.find((style) => style.description === 'subStyle') || styles.find((style) => style !== primary)
+  if (!primary) return null
+  const names = (style) => (style?.selections || []).map((selection) => runeById.get(selection.perk)).filter(Boolean)
+  const statPerks = participant.perks?.statPerks || {}
+  return {
+    primaryTree: runeById.get(primary.style) || '주 룬',
+    primaryRunes: names(primary),
+    secondaryTree: secondary ? runeById.get(secondary.style) || '보조 룬' : null,
+    secondaryRunes: names(secondary),
+    shards: [statPerks.offense, statPerks.flex, statPerks.defense].map((id) => statShardById[id]).filter(Boolean),
+    key: [primary.style, ...(primary.selections || []).map((selection) => selection.perk), secondary?.style || '', ...(secondary?.selections || []).map((selection) => selection.perk), statPerks.offense || '', statPerks.flex || '', statPerks.defense || ''].join('|'),
+  }
+}
+
 function mostPlayedRunes(games, runeById) {
   const configurations = new Map()
   for (const game of games) {
-    const runes = participantRunes(game.participant, runeById)
-    if (!runes.length) continue
-    const key = runes.join('|')
-    const current = configurations.get(key) || { count: 0, runes }
-    current.count += 1
-    configurations.set(key, current)
+    const configuration = participantRuneConfiguration(game.participant, runeById)
+    if (!configuration) continue
+    const current = configurations.get(configuration.key) || { ...configuration, games: 0, wins: 0 }
+    current.games += 1
+    if (game.participant.win) current.wins += 1
+    configurations.set(configuration.key, current)
   }
-  return [...configurations.values()].sort((a, b) => b.count - a.count)[0]?.runes || ['최근 전적에서 룬 정보를 찾지 못했습니다.']
+  const mostPlayed = [...configurations.values()].sort((a, b) => b.games - a.games || b.wins - a.wins)[0]
+  if (!mostPlayed) return null
+  return {
+    primaryTree: mostPlayed.primaryTree,
+    primaryRunes: mostPlayed.primaryRunes,
+    secondaryTree: mostPlayed.secondaryTree,
+    secondaryRunes: mostPlayed.secondaryRunes,
+    shards: mostPlayed.shards,
+    games: mostPlayed.games,
+    pickRate: Math.round((mostPlayed.games / games.length) * 100),
+    winRate: Math.round((mostPlayed.wins / mostPlayed.games) * 100),
+  }
 }
 function buildChampionStats(matches, masteries, catalog) {
   const byChampion = new Map()
@@ -207,7 +236,7 @@ function buildChampionStats(matches, masteries, catalog) {
       tier: '—', mastery: mastery?.championPoints || 0, masteryLevel: mastery?.championLevel || 0,
       aiScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
       analysisNote: count >= 5 && count < 10 ? `이번 시즌 분석 게임이 ${count}판입니다. 게임 수가 적어 AI 숙련도 결과가 정확하지 않을 수 있습니다.` : undefined,
-      runes: mostPlayedRunes(games, catalog.runeById),
+      runeInfo: mostPlayedRunes(games, catalog.runeById),
       counters: { good: ['연동 준비 중'], difficult: ['연동 준비 중'] },
       strengths: aiScore === null ? ['분석을 위한 최소 5게임이 필요합니다.'] : [winRate >= 55 ? '이번 시즌 승률이 안정적입니다.' : '이번 시즌 게임 데이터를 기반으로 분석했습니다.'],
       improvements: [count < 10 ? '플레이 표본이 적어 결과를 참고용으로 확인해 주세요.' : metrics.find((metric) => metric.tone === 'warn') ? '역할별 핵심 지표를 보완해 보세요.' : '현재 지표가 안정적으로 유지되고 있습니다.'],
