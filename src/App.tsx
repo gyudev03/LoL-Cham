@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth'
 import { collection, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
 import {
-  Check, ChevronDown, CircleAlert, Flame, Gauge, Plus, RefreshCw,
+  Check, ChevronDown, ChevronUp, CircleAlert, Flame, Gauge, Plus, RefreshCw,
   Pencil, Search, Settings2, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload,
 } from 'lucide-react'
 import { auth, db, googleProvider } from './firebase'
@@ -17,6 +17,7 @@ type Profile = {
   puuid?: string
   lane: Lane
   active: boolean
+  order?: number
   syncedAt: Date
 }
 
@@ -48,7 +49,8 @@ type Champion = {
   counters: { good: string[]; difficult: string[] }
   strengths: string[]
   improvements: string[]
-  metrics: { label: string; value: string; tone: 'good' | 'neutral' | 'warn' }[]
+  metrics: { label: string; value: string; tone: 'good' | 'neutral' | 'warn'; detail?: string }[]
+  scoreBreakdown?: { label: string; points: number; max: number; detail: string }[]
 }
 
 type SyncResult = {
@@ -65,68 +67,6 @@ const hasSyncServer = window.location.hostname === 'localhost' || Boolean(import
 const laneLabels: Record<Lane, string> = {
   TOP: '탑', JUNGLE: '정글', MID: '미드', BOTTOM: '원딜', SUPPORT: '서포터',
 }
-
-const championImage = (id: string) => `https://ddragon.leagueoflegends.com/cdn/15.20.1/img/champion/${id}.png`
-
-const mockChampions: Champion[] = [
-  {
-    id: 'Ahri', name: '아리', lane: 'MID', image: championImage('Ahri'), tier: 'A', mastery: 278450, masteryLevel: 7,
-    aiScore: 78, winRate: 60, games: 20, lastPlayed: '7일 전', runes: ['감전', '궁극의 사냥꾼', '침착', '최후의 일격'],
-    counters: { good: ['신드라', '르블랑'], difficult: ['카사딘', '피즈'] },
-    strengths: ['데스 관리가 안정적입니다.', '로밍 및 킬 관여가 좋습니다.'],
-    improvements: ['15분 이전 CS 수급을 보완해 보세요.', '최근 플레이 간격이 다소 깁니다.'],
-    metrics: [{ label: '라인전 안정성', value: '상', tone: 'good' }, { label: '로밍 관여', value: '상', tone: 'good' }, { label: '초반 CS 수급', value: '보완 필요', tone: 'warn' }],
-  },
-  {
-    id: 'Syndra', name: '신드라', lane: 'MID', image: championImage('Syndra'), tier: 'A', mastery: 102330, masteryLevel: 7,
-    aiScore: 68, winRate: 54, games: 13, lastPlayed: '2일 전', runes: ['난입', '빛의 망토', '비스킷 배달', '우주적 통찰력'],
-    counters: { good: ['오리아나', '카시오페아'], difficult: ['피즈', '르블랑'] },
-    strengths: ['교전 피해 기여도가 좋습니다.', '최근 플레이 감각이 유지되고 있습니다.'],
-    improvements: ['시야 확보 타이밍을 더 의식해 보세요.'],
-    metrics: [{ label: '교전 기여', value: '상', tone: 'good' }, { label: '최근 플레이', value: '양호', tone: 'good' }, { label: '시야 관리', value: '보통', tone: 'neutral' }],
-  },
-  {
-    id: 'Orianna', name: '오리아나', lane: 'MID', image: championImage('Orianna'), tier: 'B', mastery: 54820, masteryLevel: 6,
-    aiScore: 59, winRate: 50, games: 8, lastPlayed: '18일 전', runes: ['콩콩이 소환', '마나순환 팔찌', '비스킷 배달', '시간 왜곡 물약'],
-    counters: { good: ['탈론', '아칼리'], difficult: ['신드라', '제라스'] },
-    strengths: ['한타 위치 선정이 안정적입니다.'],
-    improvements: ['플레이 표본이 적습니다.', '최근 플레이를 통해 감각을 확인해 보세요.'],
-    metrics: [{ label: '한타 기여', value: '양호', tone: 'good' }, { label: '최근 플레이', value: '낮음', tone: 'warn' }, { label: '분석 신뢰도', value: '낮음', tone: 'warn' }],
-  },
-  {
-    id: 'Aatrox', name: '아트록스', lane: 'TOP', image: championImage('Aatrox'), tier: 'A', mastery: 151040, masteryLevel: 7,
-    aiScore: 73, winRate: 57, games: 18, lastPlayed: '4일 전', runes: ['정복자', '승전보', '뼈 방패', '불굴의 의지'],
-    counters: { good: ['나서스', '사이온'], difficult: ['피오라', '이렐리아'] },
-    strengths: ['라인 유지력이 안정적입니다.'], improvements: ['텔레포트 활용을 더 점검해 보세요.'],
-    metrics: [{ label: '라인전 안정성', value: '상', tone: 'good' }, { label: '교전 기여', value: '양호', tone: 'good' }, { label: '사이드 운영', value: '보통', tone: 'neutral' }],
-  },
-  {
-    id: 'LeeSin', name: '리 신', lane: 'JUNGLE', image: championImage('LeeSin'), tier: 'A', mastery: 210210, masteryLevel: 7,
-    aiScore: 76, winRate: 56, games: 25, lastPlayed: '1일 전', runes: ['정복자', '승전보', '마법의 신발', '우주적 통찰력'],
-    counters: { good: ['카서스', '킨드레드'], difficult: ['람머스', '볼리베어'] },
-    strengths: ['초반 오브젝트 관여가 높습니다.'], improvements: ['후반 시야 확보를 보완해 보세요.'],
-    metrics: [{ label: '오브젝트 관여', value: '상', tone: 'good' }, { label: '초반 압박', value: '상', tone: 'good' }, { label: '후반 시야', value: '보통', tone: 'neutral' }],
-  },
-  {
-    id: 'Jinx', name: '징크스', lane: 'BOTTOM', image: championImage('Jinx'), tier: 'S', mastery: 87620, masteryLevel: 6,
-    aiScore: 71, winRate: 58, games: 17, lastPlayed: '3일 전', runes: ['치명적 속도', '침착', '마법의 신발', '비스킷 배달'],
-    counters: { good: ['베인', '칼리스타'], difficult: ['드레이븐', '사미라'] },
-    strengths: ['한타 피해 기여가 좋습니다.'], improvements: ['초반 라인전 위치를 보완해 보세요.'],
-    metrics: [{ label: '한타 기여', value: '상', tone: 'good' }, { label: '데스 관리', value: '양호', tone: 'good' }, { label: '초반 라인전', value: '보통', tone: 'neutral' }],
-  },
-  {
-    id: 'Thresh', name: '쓰레쉬', lane: 'SUPPORT', image: championImage('Thresh'), tier: 'A', mastery: 190730, masteryLevel: 7,
-    aiScore: 74, winRate: 55, games: 21, lastPlayed: '5일 전', runes: ['여진', '생명의 샘', '비스킷 배달', '우주적 통찰력'],
-    counters: { good: ['블리츠크랭크', '노틸러스'], difficult: ['잔나', '밀리오'] },
-    strengths: ['시야와 교전 설계가 안정적입니다.'], improvements: ['라인 주도권 판단을 보완해 보세요.'],
-    metrics: [{ label: '시야 관리', value: '상', tone: 'good' }, { label: '교전 설계', value: '상', tone: 'good' }, { label: '라인 주도권', value: '보통', tone: 'neutral' }],
-  },
-]
-
-const initialProfiles: Profile[] = [
-  { id: 1, name: '홍길동', riotId: 'Hide on bush', tag: 'KR1', lane: 'MID', active: true, syncedAt: new Date(Date.now() - 3 * 60 * 60 * 1000) },
-  { id: 2, name: '김소환', riotId: 'Summoner Kim', tag: 'KR2', lane: 'JUNGLE', active: true, syncedAt: new Date(Date.now() - 28 * 60 * 60 * 1000) },
-]
 
 function formatMastery(value: number) { return new Intl.NumberFormat('ko-KR').format(value) }
 function syncAge(date: Date) {
@@ -156,6 +96,10 @@ function profileFromStorage(item: Omit<Profile, 'syncedAt'> & { syncedAt?: strin
 
 function profileForStorage(item: Profile) {
   return { ...item, syncedAt: item.syncedAt.toISOString() }
+}
+
+function sortProfiles(list: Profile[]) {
+  return list.every((item) => typeof item.order === 'number') ? [...list].sort((a, b) => (a.order as number) - (b.order as number)) : list
 }
 
 export default function App() {
@@ -210,6 +154,7 @@ export default function App() {
           setSharedData(false)
         }
         if (!savedProfiles.length) return
+        savedProfiles = sortProfiles(savedProfiles)
         setProfiles(savedProfiles)
         const active = savedProfiles.find((item: Profile) => item.active) ?? savedProfiles[0]
         setProfileId(active.id)
@@ -454,9 +399,10 @@ export default function App() {
             <small className="source-note">{isLiveData ? '이번 시즌 해당 라인에서 가장 많이 사용한 룬 조합입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small>
           </DetailBlock>
           <DetailBlock icon={<Trophy size={17} />} title="공식 숙련도"><div className="mastery-stat"><div><strong>{selected.masteryLevel}</strong><span>레벨</span></div><div><b>{formatMastery(selected.mastery)}점</b><small>챔피언 숙련도 점수</small></div><div><b>{selected.games}회</b><small>{isLiveData ? '시즌 분석 게임' : '최근 분석 게임'}</small></div></div></DetailBlock>
-          <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
+          <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label} title={metric.detail}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
             {selected.analysisNote && <p className="analysis-note"><CircleAlert size={13} /> {selected.analysisNote}</p>}
             <div className="insight-grid"><Insight title="강점" icon={<Check size={15} />} values={selected.strengths} tone="good" /><Insight title="개선할 점" icon={<Flame size={15} />} values={selected.improvements} tone="warn" /></div>
+            {selected.scoreBreakdown && <ScoreBreakdown items={selected.scoreBreakdown} />}
           </DetailBlock>
         </aside> : <aside className="detail-panel panel detail-empty"><Gauge size={28} /><h2>{isSyncing ? '시즌 전적을 분석하고 있습니다' : '챔피언을 기다리고 있습니다'}</h2><p>{isSyncing ? '동기화가 끝나면 실제 플레이한 챔피언이 표시됩니다.' : '새로고침으로 해당 사용자의 챔피언 데이터를 불러오세요.'}</p></aside>}
       </section>
@@ -492,6 +438,18 @@ function Insight({ title, icon, values, tone }: { title: string; icon: ReactNode
   return <div className={`insight ${tone}`}><strong>{icon}{title}</strong>{values.map((value) => <p key={value}>{value}</p>)}</div>
 }
 
+function ScoreBreakdown({ items }: { items: NonNullable<Champion['scoreBreakdown']> }) {
+  return <div className="score-breakdown">
+    <strong>점수 구성 <small>100점 만점</small></strong>
+    {items.map((item) => <div className="breakdown-row" key={item.label}>
+      <div className="breakdown-head"><span>{item.label}</span><b>{item.points}<small> / {item.max}</small></b></div>
+      <div className="breakdown-bar"><i style={{ width: `${item.max ? Math.min(100, (item.points / item.max) * 100) : 0}%` }} /></div>
+      <p>{item.detail}</p>
+    </div>)}
+    <p className="breakdown-note">지표별 기준 범위는 이 앱이 정한 고정값이며, 같은 티어 평균과 비교한 점수가 아닙니다.</p>
+  </div>
+}
+
 function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose: () => void; onSave: (profiles: Profile[]) => Promise<void> }) {
   const [rows, setRows] = useState(profiles)
   const [isAdding, setAdding] = useState(false)
@@ -503,6 +461,15 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     setForm({ name: user.name, riotId: user.riotId, tag: user.tag, lane: user.lane })
     setEditingId(user.id)
     setAdding(true)
+  }
+  function move(index: number, delta: number) {
+    setRows((current) => {
+      const target = index + delta
+      if (target < 0 || target >= current.length) return current
+      const next = [...current]
+      ;[next[index], next[target]] = [next[target], next[index]]
+      return next
+    })
   }
   function saveForm() {
     if (!form.name.trim() || !form.riotId.trim() || !form.tag.trim()) return
@@ -522,10 +489,10 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
   async function save() {
     setSaving(true)
     setSaveError('')
-    try { await onSave(rows) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
+    try { await onSave(rows.map((row, index) => ({ ...row, order: index }))) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
   }
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다.</p>
-    <div className="user-rows">{rows.map((user) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button></div>)}</div>
+    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button></div>)}</div>
     {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><input placeholder="Riot ID" value={form.riotId} onChange={(e) => setForm({ ...form, riotId: e.target.value })} /><input placeholder="태그 (예: KR1)" value={form.tag} onChange={(e) => setForm({ ...form, tag: e.target.value })} /><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
     {saveError && <p className="modal-error"><CircleAlert size={14} /> {saveError}</p>}
     <div className="modal-actions"><button className="ghost-button" onClick={onClose} disabled={isSaving}>취소</button><button className="primary-button" onClick={save} disabled={isSaving}>{isSaving ? '저장 중' : '변경사항 저장'}</button></div>

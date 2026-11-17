@@ -38,3 +38,22 @@ button, input, select { font: inherit; } button { cursor: pointer; } button:disa
 select { color-scheme: dark; }
 select option { background: #111a29; color: #e8edf5; }
 select option:checked { background: #26364f; color: #fff; }
+
+/* 사용자 관리: 순서 이동 버튼 */
+.user-move { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; }
+.user-move button { display: grid; place-items: center; width: 24px; height: 18px; padding: 0; border: 0; border-radius: 4px; color: #b7c5d8; background: #273449; transition: .2s; }
+.user-move button:hover:not(:disabled) { background: #35445c; color: #fff; }
+.user-move button:disabled { opacity: .3; cursor: default; }
+
+/* AI 숙련도: 점수 구성 */
+.score-breakdown { margin-top: 14px; padding: 12px; border: 1px solid #253148; border-radius: 6px; }
+.score-breakdown > strong { display: flex; align-items: baseline; gap: 6px; color: #d6deea; font-size: 11px; }
+.score-breakdown > strong small { color: #7d8ba0; font-size: 9px; font-weight: 400; }
+.breakdown-row { margin-top: 10px; }
+.breakdown-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 10px; color: #b9c5d6; }
+.breakdown-head b { color: #edc675; font: 700 11px 'DM Mono'; }
+.breakdown-head b small { color: #7d8ba0; font: 400 9px 'DM Mono'; }
+.breakdown-bar { height: 4px; margin-top: 4px; border-radius: 2px; background: #29364a; overflow: hidden; }
+.breakdown-bar i { display: block; height: 100%; border-radius: 2px; background: #d9ad5e; }
+.breakdown-row p { margin: 4px 0 0; color: #8190a5; font-size: 9px; line-height: 1.5; }
+.score-breakdown .breakdown-note { margin: 12px 0 0; padding-top: 9px; border-top: 1px solid #253148; color: #8190a5; font-size: 9px; line-height: 1.5; }
