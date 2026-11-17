@@ -57,3 +57,8 @@ select option:checked { background: #26364f; color: #fff; }
 .breakdown-bar i { display: block; height: 100%; border-radius: 2px; background: #d9ad5e; }
 .breakdown-row p { margin: 4px 0 0; color: #8190a5; font-size: 9px; line-height: 1.5; }
 .score-breakdown .breakdown-note { margin: 12px 0 0; padding-top: 9px; border-top: 1px solid #253148; color: #8190a5; font-size: 9px; line-height: 1.5; }
+
+/* 적합도: 내 같은 라인 평균 대비 */
+.fit-chip { display: inline-block; margin: 5px 0 0; padding: 2px 8px; border-radius: 10px; font: 700 10px 'DM Mono'; background: #273449; color: #b7c5d8; }
+.fit-chip.up { background: #1d3b33; color: #7fd8b3; }
+.fit-chip.down { background: #3a2a2d; color: #f09aa0; }

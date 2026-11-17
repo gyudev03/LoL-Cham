@@ -35,6 +35,9 @@ type Champion = {
   games: number
   lastPlayed: string
   analysisNote?: string
+  scoreNote?: string
+  rawScore?: number | null
+  fit?: { delta: number; baseline: number; games: number } | null
   runes?: string[]
   runeInfo?: {
     primaryTree: string
@@ -377,14 +380,14 @@ export default function App() {
 
       <section className="workspace">
         <div className="champion-panel panel">
-          <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">AI 숙련도순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
+          <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">숙련도 점수순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
           <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
-          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>AI 숙련도</span><span>최근 승률</span><span>메타</span></div>
+          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>최근 승률</span><span>메타</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
               <span className="champion-name"><img src={champion.image} alt="" /><b>{champion.name}</b></span>
               <span><b>{champion.masteryLevel}레벨</b><small>{formatMastery(champion.mastery)}점</small></span>
-              <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.analysisNote ? `표본 적음 · ${aiGrade(champion.aiScore)}` : aiGrade(champion.aiScore)}</small></span>
+              <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.analysisNote ? `표본 보정 · ${aiGrade(champion.aiScore)}` : aiGrade(champion.aiScore)}</small></span>
               <span><b>{champion.winRate ? `${champion.winRate}%` : '—'}</b><small>{champion.games}게임</small></span>
               <span className={tierClass(champion.tier)}>{champion.tier}</span>
             </button>)}
@@ -399,10 +402,10 @@ export default function App() {
             <small className="source-note">{isLiveData ? '이번 시즌 해당 라인에서 가장 많이 사용한 룬 조합입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small>
           </DetailBlock>
           <DetailBlock icon={<Trophy size={17} />} title="공식 숙련도"><div className="mastery-stat"><div><strong>{selected.masteryLevel}</strong><span>레벨</span></div><div><b>{formatMastery(selected.mastery)}점</b><small>챔피언 숙련도 점수</small></div><div><b>{selected.games}회</b><small>{isLiveData ? '시즌 분석 게임' : '최근 분석 게임'}</small></div></div></DetailBlock>
-          <DetailBlock icon={<Gauge size={17} />} title="AI 숙련도"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong><p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label} title={metric.detail}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
+          <DetailBlock icon={<Gauge size={17} />} title="숙련도 점수"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong>{selected.fit && <span className={`fit-chip ${selected.fit.delta >= 0 ? 'up' : 'down'}`} title={`내 ${laneLabels[selected.lane]} 다른 챔피언 ${selected.fit.games}판 평균 ${selected.fit.baseline}점 기준`}>내 {laneLabels[selected.lane]} 평균 대비 {selected.fit.delta > 0 ? '+' : ''}{selected.fit.delta}점</span>}<p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label} title={metric.detail}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
             {selected.analysisNote && <p className="analysis-note"><CircleAlert size={13} /> {selected.analysisNote}</p>}
             <div className="insight-grid"><Insight title="강점" icon={<Check size={15} />} values={selected.strengths} tone="good" /><Insight title="개선할 점" icon={<Flame size={15} />} values={selected.improvements} tone="warn" /></div>
-            {selected.scoreBreakdown && <ScoreBreakdown items={selected.scoreBreakdown} />}
+            {selected.scoreBreakdown && <ScoreBreakdown items={selected.scoreBreakdown} note={selected.scoreNote} />}
           </DetailBlock>
         </aside> : <aside className="detail-panel panel detail-empty"><Gauge size={28} /><h2>{isSyncing ? '시즌 전적을 분석하고 있습니다' : '챔피언을 기다리고 있습니다'}</h2><p>{isSyncing ? '동기화가 끝나면 실제 플레이한 챔피언이 표시됩니다.' : '새로고침으로 해당 사용자의 챔피언 데이터를 불러오세요.'}</p></aside>}
       </section>
@@ -438,7 +441,7 @@ function Insight({ title, icon, values, tone }: { title: string; icon: ReactNode
   return <div className={`insight ${tone}`}><strong>{icon}{title}</strong>{values.map((value) => <p key={value}>{value}</p>)}</div>
 }
 
-function ScoreBreakdown({ items }: { items: NonNullable<Champion['scoreBreakdown']> }) {
+function ScoreBreakdown({ items, note }: { items: NonNullable<Champion['scoreBreakdown']>; note?: string }) {
   return <div className="score-breakdown">
     <strong>점수 구성 <small>100점 만점</small></strong>
     {items.map((item) => <div className="breakdown-row" key={item.label}>
@@ -446,7 +449,8 @@ function ScoreBreakdown({ items }: { items: NonNullable<Champion['scoreBreakdown
       <div className="breakdown-bar"><i style={{ width: `${item.max ? Math.min(100, (item.points / item.max) * 100) : 0}%` }} /></div>
       <p>{item.detail}</p>
     </div>)}
-    <p className="breakdown-note">지표별 기준 범위는 이 앱이 정한 고정값이며, 같은 티어 평균과 비교한 점수가 아닙니다.</p>
+    {note && <p className="breakdown-note">{note}</p>}
+    <p className="breakdown-note">지표별 기준 범위는 이 앱이 정한 고정값이며, 같은 티어 평균과 비교한 점수가 아닙니다. 판수는 점수에 더하지 않고, 15판 미만일 때만 점수를 50점 쪽으로 보정합니다.</p>
   </div>
 }
 

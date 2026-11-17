@@ -4,6 +4,7 @@ import express from 'express'
 import { timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { evaluateChampion, computeFit } from './scoring.mjs'
 
 const app = express()
 const PORT = Number(process.env.PORT || 8787)
@@ -14,6 +15,7 @@ const DDRAGON = 'https://ddragon.leagueoflegends.com'
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), 'data')
 const CACHE_PATH = path.join(DATA_DIR, 'riot-season-cache.json')
 const USERS_PATH = path.join(DATA_DIR, 'users.json')
+const META_PATH = path.join(DATA_DIR, 'meta.json')
 const DIST_DIR = path.join(process.cwd(), 'dist')
 const APP_USERNAME = process.env.APP_USERNAME || 'chamlog'
 const APP_PASSWORD = process.env.APP_PASSWORD || ''
@@ -72,6 +74,10 @@ async function riotFetch(url) {
 
 async function loadCache() {
   try { return JSON.parse(await readFile(CACHE_PATH, 'utf8')) } catch { return { players: {} } }
+}
+
+async function loadMeta() {
+  try { return JSON.parse(await readFile(META_PATH, 'utf8')) } catch { return null }
 }
 
 async function loadUsers() {
@@ -135,8 +141,6 @@ async function getChampionCatalog() {
 const laneByTeamPosition = { TOP: 'TOP', JUNGLE: 'JUNGLE', MIDDLE: 'MID', BOTTOM: 'BOTTOM', UTILITY: 'SUPPORT' }
 const laneLabel = { TOP: '탑', JUNGLE: '정글', MID: '미드', BOTTOM: '원딜', SUPPORT: '서포터' }
 
-function clamp(value, min, max) { return Math.min(max, Math.max(min, value)) }
-function scoreBetween(value, low, high) { return clamp(((value - low) / (high - low)) * 100, 0, 100) }
 function daysAgo(timestamp) { return Math.max(0, Math.floor((Date.now() - timestamp) / 86400000)) }
 function lastPlayedLabel(timestamp) { const days = daysAgo(timestamp); return days === 0 ? '오늘' : `${days}일 전` }
 function asPercent(value) { return Math.round(value * 10) / 10 }
@@ -191,7 +195,7 @@ function mostPlayedRunes(games, runeById) {
     winRate: Math.round((mostPlayed.wins / mostPlayed.games) * 100),
   }
 }
-function buildChampionStats(matches, masteries, catalog) {
+function buildChampionStats(matches, masteries, catalog, meta = null) {
   const byChampion = new Map()
   for (const match of matches) {
     const participant = match.info.participants.find((item) => item.puuid === match.metadata.participants.find((puuid) => puuid === item.puuid))
@@ -200,80 +204,41 @@ function buildChampionStats(matches, masteries, catalog) {
     const lane = laneByTeamPosition[participant.teamPosition] || laneByTeamPosition[participant.individualPosition]
     if (!lane) continue
     const championLaneKey = `${participant.championId}:${lane}`
-    const current = byChampion.get(championLaneKey) || { championId: participant.championId, lane, games: [], wins: 0 }
-    current.games.push({ participant, createdAt: match.info.gameCreation })
-    current.wins += participant.win ? 1 : 0
+    const current = byChampion.get(championLaneKey) || { championId: participant.championId, lane, games: [] }
+    current.games.push({ participant, info: match.info, createdAt: match.info.gameCreation })
     byChampion.set(championLaneKey, current)
   }
 
   const masteryById = new Map(masteries.map((mastery) => [mastery.championId, mastery]))
-  return [...byChampion.values()].map((entry) => {
+  const results = [...byChampion.values()].map((entry) => {
     const catalogItem = catalog.byKey.get(entry.championId)
     if (!catalogItem) return null
     const games = entry.games.sort((a, b) => b.createdAt - a.createdAt)
     const count = games.length
-    const winRate = asPercent((entry.wins / count) * 100)
-    const avg = (key) => games.reduce((total, game) => total + (game.participant[key] || 0), 0) / count
-    const avgChallenge = (key) => games.reduce((total, game) => total + (game.participant.challenges?.[key] || 0), 0) / count
-    const averageMinutes = Math.max(games.reduce((total, game) => total + game.participant.timePlayed, 0) / count / 60, 1)
-    const avgCsPerMinute = (avg('totalMinionsKilled') + avg('neutralMinionsKilled')) / averageMinutes
-    const avgDamagePerMinute = avgChallenge('damagePerMinute')
-    const avgGoldPerMinute = avgChallenge('goldPerMinute')
-    const avgKillParticipation = avgChallenge('killParticipation') * 100
-    const avgVisionPerMinute = avgChallenge('visionScorePerMinute') || avg('visionScore') / averageMinutes
-    const avgControlWards = avg('visionWardsBoughtInGame')
-    const avgJungleCsBefore10 = avgChallenge('jungleCsBefore10Minutes')
-
-    let roleScore = 0
-    let metrics = []
-    if (entry.lane === 'JUNGLE') {
-      const jungleFarmScore = scoreBetween(avgJungleCsBefore10, 10, 35)
-      const participationScore = scoreBetween(avgKillParticipation, 30, 75)
-      const combatScore = scoreBetween(avgDamagePerMinute, 250, 750)
-      roleScore = jungleFarmScore * .35 + participationScore * .4 + combatScore * .25
-      metrics = [
-        { label: '초반 정글링', value: avgJungleCsBefore10 >= 25 ? '상' : avgJungleCsBefore10 >= 17 ? '보통' : '보완 필요', tone: avgJungleCsBefore10 >= 25 ? 'good' : avgJungleCsBefore10 >= 17 ? 'neutral' : 'warn' },
-        { label: '킬 관여', value: avgKillParticipation >= 55 ? '상' : avgKillParticipation >= 40 ? '보통' : '보완 필요', tone: avgKillParticipation >= 55 ? 'good' : avgKillParticipation >= 40 ? 'neutral' : 'warn' },
-        { label: '교전 기여', value: avgDamagePerMinute >= 500 ? '양호' : '보완 필요', tone: avgDamagePerMinute >= 500 ? 'good' : 'warn' },
-      ]
-    } else if (entry.lane === 'SUPPORT') {
-      const visionScore = scoreBetween(avgVisionPerMinute, .6, 2.8)
-      const participationScore = scoreBetween(avgKillParticipation, 35, 80)
-      const wardScore = scoreBetween(avgControlWards, 2, 10)
-      roleScore = visionScore * .45 + participationScore * .35 + wardScore * .2
-      metrics = [
-        { label: '시야 관리', value: avgVisionPerMinute >= 1.8 ? '상' : avgVisionPerMinute >= 1.1 ? '보통' : '보완 필요', tone: avgVisionPerMinute >= 1.8 ? 'good' : avgVisionPerMinute >= 1.1 ? 'neutral' : 'warn' },
-        { label: '킬 관여', value: avgKillParticipation >= 60 ? '상' : avgKillParticipation >= 45 ? '보통' : '보완 필요', tone: avgKillParticipation >= 60 ? 'good' : avgKillParticipation >= 45 ? 'neutral' : 'warn' },
-        { label: '제어 와드', value: avgControlWards >= 5 ? '양호' : '보완 필요', tone: avgControlWards >= 5 ? 'good' : 'warn' },
-      ]
-    } else {
-      const csScore = scoreBetween(avgCsPerMinute, 4, 8)
-      const goldScore = scoreBetween(avgGoldPerMinute, 260, 480)
-      const combatScore = scoreBetween(avgDamagePerMinute, 280, 850)
-      roleScore = csScore * .4 + goldScore * .3 + combatScore * .3
-      metrics = [
-        { label: 'CS 수급', value: avgCsPerMinute >= 6.5 ? '상' : avgCsPerMinute >= 5 ? '보통' : '보완 필요', tone: avgCsPerMinute >= 6.5 ? 'good' : avgCsPerMinute >= 5 ? 'neutral' : 'warn' },
-        { label: '골드 수급', value: avgGoldPerMinute >= 390 ? '양호' : '보완 필요', tone: avgGoldPerMinute >= 390 ? 'good' : 'warn' },
-        { label: '전투 기여', value: avgDamagePerMinute >= 500 ? '양호' : '보완 필요', tone: avgDamagePerMinute >= 500 ? 'good' : 'warn' },
-      ]
-    }
-    const frequency = clamp(count / 12, 0, 1) * 15
-    const sample = clamp(count / 20, 0, 1) * 10
-    const aiScore = count < 5 ? null : Math.round(roleScore * .5 + winRate * .2 + frequency + sample + 2.5)
+    const winRate = asPercent((games.filter((game) => game.participant.win).length / count) * 100)
+    const evaluation = evaluateChampion(entry.lane, games)
     const mastery = masteryById.get(entry.championId)
+    const metaEntry = meta?.champions?.[`${entry.championId}:${entry.lane}`]
+    const counterNames = (list) => (list || []).map((counter) => typeof counter === 'string' ? counter : catalog.byKey.get(counter.id)?.name).filter(Boolean)
+    const goodCounters = counterNames(metaEntry?.counters?.good)
+    const difficultCounters = counterNames(metaEntry?.counters?.difficult)
+    const emptyCounter = [meta ? '표본 부족' : '메타 데이터 없음']
     return {
       id: catalogItem.id, entryId: `${catalogItem.id}:${entry.lane}`, name: catalogItem.name, lane: entry.lane,
       image: `${DDRAGON}/cdn/${catalog.version}/img/champion/${catalogItem.image.full}`,
-      tier: '—', mastery: mastery?.championPoints || 0, masteryLevel: mastery?.championLevel || 0,
-      aiScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
-      analysisNote: count >= 5 && count < 10 ? `이번 시즌 분석 게임이 ${count}판입니다. 게임 수가 적어 AI 숙련도 결과가 정확하지 않을 수 있습니다.` : undefined,
+      tier: metaEntry?.tier ?? '—', mastery: mastery?.championPoints || 0, masteryLevel: mastery?.championLevel || 0,
+      aiScore: evaluation.aiScore, rawScore: evaluation.rawScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
+      analysisNote: evaluation.analysisNote, scoreNote: evaluation.scoreNote,
       runeInfo: mostPlayedRunes(games, catalog.runeById),
-      counters: { good: ['연동 준비 중'], difficult: ['연동 준비 중'] },
-      strengths: aiScore === null ? ['분석을 위한 최소 5게임이 필요합니다.'] : [winRate >= 55 ? '이번 시즌 승률이 안정적입니다.' : '이번 시즌 게임 데이터를 기반으로 분석했습니다.'],
-      improvements: [count < 10 ? '플레이 표본이 적어 결과를 참고용으로 확인해 주세요.' : metrics.find((metric) => metric.tone === 'warn') ? '역할별 핵심 지표를 보완해 보세요.' : '현재 지표가 안정적으로 유지되고 있습니다.'],
-      metrics,
+      counters: { good: goodCounters.length ? goodCounters : emptyCounter, difficult: difficultCounters.length ? difficultCounters : emptyCounter },
+      strengths: evaluation.strengths, improvements: evaluation.improvements,
+      metrics: evaluation.metrics, scoreBreakdown: evaluation.scoreBreakdown,
     }
   }).filter(Boolean)
+
+  // 적합도: 같은 라인의 다른 챔피언 평균 원점수와의 차이
+  const fits = computeFit(results.map((item) => ({ key: item.entryId, lane: item.lane, count: item.games, rawScore: item.rawScore })))
+  return results.map((item) => ({ ...item, fit: fits.get(item.entryId) ?? null }))
 }
 
 app.get('/api/users', async (_request, response) => {
@@ -344,7 +309,7 @@ async function runSeasonSync(job, gameName, tagLine) {
       .filter((match) => match.info.participants.some((participant) => participant.puuid === account.puuid))
       .sort((a, b) => b.info.gameCreation - a.info.gameCreation)
     const ownedMatches = matches.map((match) => ({ ...match, metadata: { ...match.metadata, participants: [account.puuid] } }))
-    const championStats = buildChampionStats(ownedMatches, masteries, catalog)
+    const championStats = buildChampionStats(ownedMatches, masteries, catalog, await loadMeta())
     const ranked = leagueEntries.find((entry) => entry.queueType === 'RANKED_SOLO_5x5') || leagueEntries.find((entry) => entry.queueType === 'RANKED_FLEX_SR')
     job.result = {
       account: { puuid: account.puuid, gameName: account.gameName, tagLine: account.tagLine, rank: ranked ? `${ranked.tier} ${ranked.rank} ${ranked.leaguePoints}LP` : '랭크 정보 없음' },
