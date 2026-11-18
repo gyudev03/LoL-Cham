@@ -1,6 +1,6 @@
 // 사용법: node calibrate.mjs [puuid]     (server 폴더에서 실행. puuid를 생략하면 캐시의 모든 사용자를 출력)
 // 캐시된 경기에서 라인별 '내 평균 지표값'과 현재 기준표(low~high), 그 지표의 점수를 보여준다. 기준값을 실제 데이터로 맞출 때 사용한다.
-import { evaluateChampion, LANE_RULES, measureOption } from './scoring.mjs'
+import { evaluateChampion, LANE_RULES, MEASURES, measureOption } from './scoring.mjs'
 import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -43,6 +43,10 @@ for (const [puuid, player] of Object.entries(cache.players || {})) {
         }
       }
     }
+    // 참고(점수 미반영): 계산식이 맞는지 점검하기 위한 값. 예) 정글이 아닌 라인의 오브젝트 참여율이 비정상적으로 높으면 계산식을 의심한다.
+    const reference = ['objectiveShare', 'killParticipation'].map((id) => { const r = measureOption({ id, low: 0, high: 100 }, games); return r ? `${MEASURES[id].subject} ${r.shown}` : null }).filter(Boolean)
+    const avg = (key) => (games.reduce((sum, game) => sum + (game.participant[key] || 0), 0) / games.length).toFixed(1)
+    console.log(`  (참고) ${reference.join(' · ')} · 평균 K/D/A ${avg('kills')}/${avg('deaths')}/${avg('assists')}`)
     const byChampion = {}
     for (const game of games) (byChampion[game.participant.championId] ??= []).push(game)
     const rows = Object.entries(byChampion).filter(([, list]) => list.length >= 5).map(([id, list]) => ({ id, n: list.length, r: evaluateChampion(lane, list) }))

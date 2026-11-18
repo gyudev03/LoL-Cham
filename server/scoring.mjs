@@ -22,18 +22,16 @@ const round1 = (value) => Math.round(value * 10) / 10
 const finite = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
 const minutesOf = (participant) => Math.max((finite(participant.timePlayed) ?? 0) / 60, 1)
 
-// 팀이 챙긴 드래곤·전령·바론 중 내가 관여한 비율(%).
+// 오브젝트 관여율: 그 판에서 처치된 드래곤·전령·바론 전체(양 팀 합) 중, 내가 개입해서 얻은 비율(%).
+// 상대에게 내준 오브젝트도 분모에 들어가므로, 합류가 늦거나 내주는 일이 많으면 낮아진다.
 // Riot challenges는 값이 0이면 필드가 빠지는 경우가 있어, challenges 자체가 있는 경기에서는 빠진 필드를 0으로 본다.
 const TAKEDOWN_KEYS = ['dragonTakedowns', 'baronTakedowns', 'riftHeraldTakedowns']
 const hasChallenges = (participant) => finite(participant.challenges?.goldPerMinute) !== null || finite(participant.challenges?.damagePerMinute) !== null
 const hasTakedownField = (participant) => TAKEDOWN_KEYS.some((key) => finite(participant.challenges?.[key]) !== null)
-function objectiveParticipation(participant, info) {
+function objectiveShare(participant, info) {
   if (!hasChallenges(participant)) return null
   const mine = TAKEDOWN_KEYS.reduce((sum, key) => sum + (finite(participant.challenges[key]) ?? 0), 0)
-  const team = (info?.teams || []).find((item) => item.teamId === participant.teamId)
-  const objectives = team?.objectives
-  if (!objectives) return null
-  const total = ['dragon', 'baron', 'riftHerald'].reduce((sum, key) => sum + (finite(objectives[key]?.kills) ?? 0), 0)
+  const total = (info?.teams || []).reduce((sum, team) => sum + ['dragon', 'baron', 'riftHerald'].reduce((inner, key) => inner + (finite(team.objectives?.[key]?.kills) ?? 0), 0), 0)
   if (total <= 0) return null
   return clamp((mine / total) * 100, 0, 100)
 }
@@ -80,9 +78,9 @@ export const MEASURES = {
     extract: (p) => (finite(p.totalDamageTaken) !== null && finite(p.deaths) !== null ? p.totalDamageTaken / (p.deaths + 1) : null),
     strong: '맞은 피해에 비해 잘 살아남습니다.', weak: '낮은 편입니다. 앞라인에서 버티는 시간과 이탈 판단을 점검해 보세요.',
   },
-  deathsPerMinute: {
-    subject: '분당 데스', unit: '', digits: 2,
-    extract: (p) => (finite(p.deaths) !== null ? p.deaths / minutesOf(p) : null),
+  deathsPerGame: {
+    subject: '판당 데스', unit: '', digits: 1,
+    extract: (p) => finite(p.deaths),
     strong: '죽음이 적어 안정적으로 플레이합니다.', weak: '데스가 잦은 편입니다. 무리한 교전과 진입 타이밍을 복기해 보세요.',
   },
   killParticipation: {
@@ -100,47 +98,55 @@ export const MEASURES = {
     extract: (p) => finite(p.visionWardsBoughtInGame),
     strong: '제어 와드를 꾸준히 구매합니다.', weak: '적은 편입니다. 귀환할 때마다 1개씩 구매해 보세요.',
   },
-  objectiveParticipation: {
-    subject: '오브젝트 참여율', unit: '%', digits: 0,
-    extract: objectiveParticipation,
+  objectiveShare: {
+    subject: '오브젝트 관여율', unit: '%', digits: 0,
+    extract: objectiveShare,
     supported: (games) => games.some((game) => hasTakedownField(game.participant)),
-    strong: '팀 오브젝트에 꾸준히 합류합니다.', weak: '낮은 편입니다. 드래곤·전령 타이밍에 맞춰 이동해 보세요.',
+    strong: '게임 전체 오브젝트에 꾸준히 개입합니다.', weak: '낮은 편입니다. 합류가 늦거나 상대에게 내주는 오브젝트가 많습니다. 드래곤·전령 타이밍에 맞춰 이동해 보세요.',
   },
 }
 
 // 지표: weight는 카테고리 안에서의 비율. options가 둘 이상이면 점수가 높은 쪽을 채택한다(탑·정글 전투).
 const m = (id, low, high, weight = 1) => ({ weight, options: [{ id, low, high }] })
-const FRONTLINE = (dpmLow, dpmHigh) => ({ label: '전투 기여', weight: 1, options: [{ id: 'damagePerMinute', low: dpmLow, high: dpmHigh }, { id: 'damageTakenPerDeath', low: 3000, high: 11000 }] })
+// 탑·정글 전투: 피해량과 '데스당 받은 피해' 중 높은 쪽을 쓴다
+const FRONTLINE = (dpmLow, dpmHigh) => ({ label: '전투 기여', weight: 1, options: [{ id: 'damagePerMinute', low: dpmLow, high: dpmHigh }, { id: 'damageTakenPerDeath', low: 3000, high: 9000 }] })
 const growth = (points, cs, gold, early) => ({ label: '성장', points, metrics: [m('csPerMinute', ...cs, .4), m('goldPerMinute', ...gold, .3), m('earlyCs', ...early, .3)] })
+// 기준값 보정 근거: 한국 서버 계정 3개의 라인별 평균(챌린저 13위 약 1,000판 / 프로게이머 약 550판 / 플래티넘 2 약 520판)
+//  - high(만점 기준) = 챌린저·프로 평균 수준, low(0점 기준) = 플래티넘 평균보다 한참 아래.
+//    그 결과 플래티넘 2는 대략 60점대, 챌린저·프로는 80점대 중반 이상이 되도록 맞췄다.
+//  - 데스는 판당으로 센다(약 29분 기준 플래티넘 5.8 · 챌린저 5.5 · 프로 4.6). 9판당 이상이면 0점, 4 이하면 만점.
+//  - 오브젝트 관여율은 '양 팀이 처치한 전체 오브젝트 중 내가 개입한 비율'이라 아직 실측 데이터로 맞추지 못했다(잠정 20~55%).
+//  - 정글·서폿·탑은 표본이 적어(12~68판) 잠정값이다. 다른 계정 데이터가 쌓이면 다시 맞춘다.
+const DEATHS = m('deathsPerGame', 9, 4)
 
 export const LANE_RULES = {
   TOP: [
-    growth(30, [4, 8], [260, 480], [45, 80]),
-    { label: '전투', points: 35, metrics: [FRONTLINE(280, 850)] },
-    { label: '생존', points: 25, metrics: [m('deathsPerMinute', .30, .08)] },
+    growth(30, [5, 8.5], [320, 450], [50, 85]),
+    { label: '전투', points: 35, metrics: [FRONTLINE(400, 900)] },
+    { label: '생존', points: 25, metrics: [DEATHS] },
   ],
   JUNGLE: [
-    { label: '오브젝트', points: 20, metrics: [m('objectiveParticipation', 20, 80)] },
-    { label: '성장', points: 15, metrics: [m('jungleCs10', 10, 35, .5), m('goldPerMinute', 260, 480, .5)] },
-    { label: '전투', points: 15, metrics: [FRONTLINE(250, 750)] },
-    { label: '생존', points: 15, metrics: [m('deathsPerMinute', .28, .08)] },
-    { label: '팀 기여', points: 25, metrics: [m('killParticipation', 30, 75)] },
+    { label: '오브젝트', points: 20, metrics: [m('objectiveShare', 20, 55)] },
+    { label: '성장', points: 15, metrics: [m('jungleCs10', 45, 72, .5), m('goldPerMinute', 300, 480, .5)] },
+    { label: '전투', points: 15, metrics: [FRONTLINE(300, 750)] },
+    { label: '생존', points: 15, metrics: [DEATHS] },
+    { label: '팀 기여', points: 25, metrics: [m('killParticipation', 30, 70)] },
   ],
   MID: [
-    growth(25, [4, 8], [260, 480], [45, 80]),
-    { label: '전투', points: 25, metrics: [m('damagePerMinute', 280, 850)] },
-    { label: '생존', points: 20, metrics: [m('deathsPerMinute', .25, .07)] },
-    { label: '팀 기여', points: 20, metrics: [m('killParticipation', 35, 75)] },
+    growth(25, [5.5, 9], [350, 450], [55, 90]),
+    { label: '전투', points: 25, metrics: [m('damagePerMinute', 500, 900)] },
+    { label: '생존', points: 20, metrics: [DEATHS] },
+    { label: '팀 기여', points: 20, metrics: [m('killParticipation', 25, 55)] },
   ],
   BOTTOM: [
-    growth(25, [5, 9], [300, 500], [50, 85]),
-    { label: '전투', points: 35, metrics: [m('damagePerMinute', 350, 950)] },
-    { label: '생존', points: 30, metrics: [m('deathsPerMinute', .25, .07)] },
+    growth(25, [6, 9], [380, 520], [50, 78]),
+    { label: '전투', points: 35, metrics: [m('damagePerMinute', 500, 900)] },
+    { label: '생존', points: 30, metrics: [DEATHS] },
   ],
   SUPPORT: [
-    { label: '시야', points: 35, metrics: [m('visionPerMinute', .6, 2.8, .7), m('controlWards', 2, 10, .3)] },
-    { label: '팀 기여', points: 30, metrics: [m('killParticipation', 35, 80)] },
-    { label: '생존', points: 25, metrics: [m('deathsPerMinute', .28, .10)] },
+    { label: '시야', points: 35, metrics: [m('visionPerMinute', 1.5, 3.3, .7), m('controlWards', 2, 10, .3)] },
+    { label: '팀 기여', points: 30, metrics: [m('killParticipation', 35, 70)] },
+    { label: '생존', points: 25, metrics: [DEATHS] },
   ],
 }
 
