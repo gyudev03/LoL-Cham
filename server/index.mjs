@@ -280,6 +280,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     const cache = await loadCache()
     const cachedPlayer = cache.players[account.puuid]
     const player = cachedPlayer?.seasonStart === startTime ? cachedPlayer : { seasonStart: startTime, matches: {} }
+    player.account = { gameName: account.gameName, tagLine: account.tagLine }
     cache.players[account.puuid] = player
 
     const [masteries, leagueEntries, catalog, matchIds] = await Promise.all([
@@ -314,6 +315,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     job.result = {
       account: { puuid: account.puuid, gameName: account.gameName, tagLine: account.tagLine, rank: ranked ? `${ranked.tier} ${ranked.rank} ${ranked.leaguePoints}LP` : '랭크 정보 없음' },
       champions: championStats,
+      totals: { games: matches.length, wins: matches.filter((match) => match.info.participants.find((participant) => participant.puuid === account.puuid)?.win).length },
       syncedAt: new Date().toISOString(),
       matchCount: matches.length,
       seasonStart: new Date(startTime * 1000).toISOString(),
@@ -356,6 +358,42 @@ app.get('/api/riot/summary/:puuid', async (request, response) => {
   const summary = cache.players?.[request.params.puuid]?.summary
   if (!summary) return response.status(404).json({ message: '저장된 분석 결과가 없습니다. 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' })
   response.json(summary)
+})
+
+// 이 PC 서버에 저장된 데이터 목록: 사용자 이름(Riot ID)과 저장 현황을 확인한다.
+function playerIdentity(puuid, player) {
+  const account = player.summary?.account || player.account
+  if (account?.gameName) return { gameName: account.gameName, tagLine: account.tagLine || '' }
+  // 요약이 없는 예전 캐시는 저장된 경기 기록에서 이름을 찾는다.
+  for (const match of Object.values(player.matches || {})) {
+    const participant = match?.info?.participants?.find((item) => item.puuid === puuid)
+    if (participant?.riotIdGameName) return { gameName: participant.riotIdGameName, tagLine: participant.riotIdTagline || '' }
+  }
+  return { gameName: '', tagLine: '' }
+}
+
+app.get('/api/riot/cache', async (_request, response) => {
+  const cache = await loadCache()
+  const players = Object.entries(cache.players || {}).map(([puuid, player]) => ({
+    puuid,
+    ...playerIdentity(puuid, player),
+    matchCount: Object.keys(player.matches || {}).length,
+    hasSummary: Boolean(player.summary),
+    championCount: player.summary?.champions?.length ?? 0,
+    syncedAt: player.summary?.syncedAt ?? null,
+  }))
+  response.json({ players })
+})
+
+app.delete('/api/riot/cache/:puuid', async (request, response) => {
+  if ([...syncJobs.values()].some((job) => job.status === 'queued' || job.status === 'running')) {
+    return response.status(409).json({ message: '동기화가 진행 중입니다. 끝나거나 취소된 뒤 다시 삭제하세요.' })
+  }
+  const cache = await loadCache()
+  if (!cache.players?.[request.params.puuid]) return response.status(404).json({ message: '삭제할 저장 데이터를 찾지 못했습니다.' })
+  delete cache.players[request.params.puuid]
+  await saveCache(cache)
+  response.json({ ok: true })
 })
 
 app.delete('/api/riot/sync/:jobId', (request, response) => {
