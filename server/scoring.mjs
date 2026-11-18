@@ -115,7 +115,8 @@ const growth = (points, cs, gold, early) => ({ label: '성장', points, metrics:
 //  - high(만점 기준) = 챌린저·프로 평균 수준, low(0점 기준) = 플래티넘 평균보다 한참 아래.
 //    그 결과 플래티넘 2는 대략 60점대, 챌린저·프로는 80점대 중반 이상이 되도록 맞췄다.
 //  - 데스는 판당으로 센다(약 29분 기준 플래티넘 5.8 · 챌린저 5.5 · 프로 4.6). 9판당 이상이면 0점, 4 이하면 만점.
-//  - 오브젝트 관여율은 '양 팀이 처치한 전체 오브젝트 중 내가 개입한 비율'이라 아직 실측 데이터로 맞추지 못했다(잠정 20~55%).
+//  - 오브젝트 관여율은 '양 팀이 처치한 전체 오브젝트 중 내가 개입한 비율'. 정글 랭커 708판(승률 52%)의 평균이 53%라서, 만점 기준을 60%로 두어 여유를 남겼다.
+//  - 정글 랭커 708판 실측: 10분 전 정글 CS 68.2, 골드 460, 분당 피해량 735, 판당 데스 4.9, 킬 관여율 60% → 각 지표가 76~97%에 오도록 확인했다.
 //  - 정글·서폿·탑은 표본이 적어(12~68판) 잠정값이다. 다른 계정 데이터가 쌓이면 다시 맞춘다.
 const DEATHS = m('deathsPerGame', 9, 4)
 
@@ -126,7 +127,7 @@ export const LANE_RULES = {
     { label: '생존', points: 25, metrics: [DEATHS] },
   ],
   JUNGLE: [
-    { label: '오브젝트', points: 20, metrics: [m('objectiveShare', 20, 55)] },
+    { label: '오브젝트', points: 20, metrics: [m('objectiveShare', 20, 60)] },
     { label: '성장', points: 15, metrics: [m('jungleCs10', 45, 72, .5), m('goldPerMinute', 300, 480, .5)] },
     { label: '전투', points: 15, metrics: [FRONTLINE(300, 750)] },
     { label: '생존', points: 15, metrics: [DEATHS] },
