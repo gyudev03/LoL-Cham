@@ -110,7 +110,6 @@ function topChampion(list: Champion[], preferredLane?: Lane) {
   return (preferredLane && best(list.filter((item) => item.lane === preferredLane))) || best(list)
 }
 
-function tierClass(tier: Champion['tier']) { return `tier tier-${tier.toLowerCase()}` }
 function championEntryId(champion: Champion) { return champion.entryId ?? champion.id }
 function aiGrade(score: number | null) {
   if (score === null) return '데이터 부족'
@@ -479,21 +478,21 @@ export default function App() {
         <div className="champion-panel panel">
           <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">숙련도 점수순</option><option value="mastery">공식 숙련도순</option><option value="win">시즌 승률순</option></select></div></div>
           <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
-          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>시즌 승률</span><span>메타</span></div>
+          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>시즌 승률</span><span>내 라인 평균 대비</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
               <span className="champion-name"><img src={champion.image} alt="" /><b>{champion.name}</b></span>
               <span><b>{champion.masteryLevel}레벨</b><small>{formatMastery(champion.mastery)}점</small></span>
               <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.analysisNote ? `표본 보정 · ${aiGrade(champion.aiScore)}` : aiGrade(champion.aiScore)}</small></span>
               <span><b>{champion.winRate !== null ? `${champion.winRate}%` : '—'}</b><small>{champion.games}게임</small></span>
-              <span className={tierClass(champion.tier)}>{champion.tier}</span>
+              <span title={champion.fit ? `내 ${laneLabels[champion.lane]} 다른 챔피언 ${champion.fit.games}판 평균 ${champion.fit.baseline}점 기준` : undefined}>{champion.fit ? <><b className={`fit-delta ${champion.fit.delta > 0 ? 'up' : champion.fit.delta < 0 ? 'down' : ''}`}>{champion.fit.delta > 0 ? '+' : ''}{champion.fit.delta}점</b><small>다른 챔피언 {champion.fit.games}판 기준</small></> : <><b>—</b><small>비교 데이터 부족</small></>}</span>
             </button>)}
             {!laneChampions.length && <div className="empty">검색 결과가 없습니다.</div>}
           </div>
         </div>
 
         {selected ? <aside className="detail-panel panel">
-          <div className="detail-title"><img src={selected.image} alt="" /><div><p className="eyebrow">{laneLabels[selected.lane]}</p><h2>{selected.name}</h2></div><span className={tierClass(selected.tier)}>{selected.tier}<small>메타 티어</small></span></div>
+          <div className="detail-title"><img src={selected.image} alt="" /><div><p className="eyebrow">{laneLabels[selected.lane]}</p><h2>{selected.name}</h2></div></div>
           <DetailBlock icon={<Sparkles size={17} />} title="룬 정보">
             {selected.runeInfo ? <RuneInfo info={selected.runeInfo} /> : <div className="runes">{(selected.runes || ['룬 정보를 찾지 못했습니다.']).map((rune, index) => <span key={rune} className={index === 0 ? 'keystone' : ''}>{rune}</span>)}</div>}
             <small className="source-note">{isLiveData ? '이번 시즌 해당 라인에서 가장 많이 사용한 룬 조합입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small>
