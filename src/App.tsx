@@ -61,10 +61,25 @@ type LocalCacheEntry = {
   matchCount: number; hasSummary: boolean; championCount: number; syncedAt: string | null
 }
 
+type SeasonTotals = { games: number; wins: number }
+
 type SyncResult = {
   champions: Champion[]
-  account: { puuid: string; gameName: string; tagLine: string }
+  account: { puuid: string; gameName: string; tagLine: string; rank?: string }
+  totals?: SeasonTotals
   syncedAt: string
+}
+
+const tierNames: Record<string, string> = {
+  IRON: '아이언', BRONZE: '브론즈', SILVER: '실버', GOLD: '골드', PLATINUM: '플래티넘', EMERALD: '에메랄드',
+  DIAMOND: '다이아몬드', MASTER: '마스터', GRANDMASTER: '그랜드마스터', CHALLENGER: '챌린저',
+}
+const apexTiers = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER'])
+function formatRank(rank?: string) {
+  if (!rank || rank === '랭크 정보 없음') return null
+  const [tier, division, points] = rank.split(' ')
+  const name = tierNames[tier] ?? tier
+  return { label: apexTiers.has(tier) ? name : `${name} ${division}`, points: points ?? '' }
 }
 
 const sharedProfiles = collection(db, 'shared', 'chamlog', 'profiles')
@@ -154,6 +169,7 @@ export default function App() {
   const [sortBy, setSortBy] = useState<'ai' | 'mastery' | 'win'>('ai')
   const [isUserModalOpen, setUserModalOpen] = useState(false)
   const [isDataModalOpen, setDataModalOpen] = useState(false)
+  const [summaryMeta, setSummaryMeta] = useState<{ rank?: string; totals?: SeasonTotals } | null>(null)
   const [isSyncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
   const [syncProgress, setSyncProgress] = useState('')
@@ -211,6 +227,15 @@ export default function App() {
     void loadProfiles()
   }, [])
 
+  // 사용자 전체 시즌 승률: 서버가 집계한 값을 쓰고, 예전 데이터는 챔피언별 값으로 계산한다.
+  const seasonRecord = useMemo<SeasonTotals | null>(() => {
+    if (summaryMeta?.totals?.games) return summaryMeta.totals
+    const games = championData.reduce((sum, item) => sum + item.games, 0)
+    const wins = Math.round(championData.reduce((sum, item) => sum + (item.winRate ?? 0) * item.games / 100, 0))
+    return games ? { games, wins } : null
+  }, [summaryMeta, championData])
+  const rankInfo = formatRank(summaryMeta?.rank)
+
   const laneChampions = useMemo(() => championData
     .filter((champion) => champion.lane === lane && champion.name.includes(query.trim()))
     .sort((a, b) => sortBy === 'mastery' ? b.mastery - a.mastery : sortBy === 'win' ? (b.winRate ?? 0) - (a.winRate ?? 0) : (b.aiScore ?? 0) - (a.aiScore ?? 0)), [championData, lane, query, sortBy])
@@ -226,6 +251,7 @@ export default function App() {
     setChampionData([])
     setSelectedId('')
     setLiveData(false)
+    setSummaryMeta(null)
     try {
       let payload: SyncResult | null = null
       const directSummary = await getDoc(summaryRef(targetProfile.id))
@@ -254,6 +280,7 @@ export default function App() {
       }
       if (!payload?.champions?.length) return
       const loaded = payload
+      setSummaryMeta({ rank: loaded.account?.rank, totals: loaded.totals })
       if (loaded.account?.puuid && !targetProfile.puuid && accountMatchesProfile(targetProfile, loaded.account)) {
         setProfiles((current) => current.map((item) => item.id === targetProfile.id && !item.puuid
           ? { ...item, puuid: loaded.account.puuid, syncedAt: loaded.syncedAt ? new Date(loaded.syncedAt) : item.syncedAt }
@@ -296,6 +323,7 @@ export default function App() {
       if (!result.champions.length) throw new Error('이번 시즌에 분석 가능한 솔로·자유랭크 전적을 찾지 못했습니다.')
       setChampionData(result.champions)
       setLiveData(true)
+      setSummaryMeta({ rank: result.account.rank, totals: result.totals })
       setProfiles((current) => {
         const nextProfiles = current.map((item) => item.id === targetProfile.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) } : item)
         const updatedProfile = nextProfiles.find((item) => item.id === targetProfile.id) ?? targetProfile
@@ -351,7 +379,8 @@ export default function App() {
     try {
       await persistProfiles(profiles)
       await setDoc(await resolveSummaryRef(profile), {
-        account: { puuid: profile.puuid || '', gameName: profile.riotId, tagLine: profile.tag },
+        account: { puuid: profile.puuid || '', gameName: profile.riotId, tagLine: profile.tag, ...(summaryMeta?.rank ? { rank: summaryMeta.rank } : {}) },
+        ...(summaryMeta?.totals ? { totals: summaryMeta.totals } : {}),
         champions: championData,
         syncedAt: profile.syncedAt.toISOString(),
       })
@@ -380,7 +409,7 @@ export default function App() {
     setAdmin(false)
   }
 
-  async function waitForSync(jobId: string): Promise<{ champions: Champion[]; account: { puuid: string; gameName: string; tagLine: string }; syncedAt: string }> {
+  async function waitForSync(jobId: string): Promise<SyncResult> {
     while (true) {
       const response = await fetch(`${syncApiBase}/riot/sync/${jobId}`)
       const payload = await response.json()
@@ -436,6 +465,10 @@ export default function App() {
           </select><ChevronDown size={16} /></div>
         </div>
         <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div><strong>{profile.riotId}<span>#{profile.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></div></div>
+        <div className="profile-stats">
+          <div className="profile-stat"><small>현재 티어</small><strong>{rankInfo ? rankInfo.label : '—'}</strong><span>{rankInfo ? rankInfo.points : isLiveData ? '랭크 정보 없음' : '동기화 필요'}</span></div>
+          <div className="profile-stat"><small>시즌 승률</small><strong>{seasonRecord ? `${(seasonRecord.wins / seasonRecord.games * 100).toFixed(1)}%` : '—'}</strong><span>{seasonRecord ? `${seasonRecord.games}판 · ${seasonRecord.wins}승 ${seasonRecord.games - seasonRecord.wins}패` : '집계된 데이터 없음'}</span></div>
+        </div>
       </section>
 
       <nav className="lane-tabs" aria-label="라인 선택">
@@ -444,15 +477,15 @@ export default function App() {
 
       <section className="workspace">
         <div className="champion-panel panel">
-          <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">숙련도 점수순</option><option value="mastery">공식 숙련도순</option><option value="win">최근 승률순</option></select></div></div>
+          <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">숙련도 점수순</option><option value="mastery">공식 숙련도순</option><option value="win">시즌 승률순</option></select></div></div>
           <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
-          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>최근 승률</span><span>메타</span></div>
+          <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>시즌 승률</span><span>메타</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
               <span className="champion-name"><img src={champion.image} alt="" /><b>{champion.name}</b></span>
               <span><b>{champion.masteryLevel}레벨</b><small>{formatMastery(champion.mastery)}점</small></span>
               <span className="score"><b>{champion.aiScore ?? '—'}</b><small>{champion.analysisNote ? `표본 보정 · ${aiGrade(champion.aiScore)}` : aiGrade(champion.aiScore)}</small></span>
-              <span><b>{champion.winRate ? `${champion.winRate}%` : '—'}</b><small>{champion.games}게임</small></span>
+              <span><b>{champion.winRate !== null ? `${champion.winRate}%` : '—'}</b><small>{champion.games}게임</small></span>
               <span className={tierClass(champion.tier)}>{champion.tier}</span>
             </button>)}
             {!laneChampions.length && <div className="empty">검색 결과가 없습니다.</div>}
@@ -466,7 +499,7 @@ export default function App() {
             <small className="source-note">{isLiveData ? '이번 시즌 해당 라인에서 가장 많이 사용한 룬 조합입니다. 룬 명칭은 Riot Data Dragon 기준입니다.' : 'Riot API 연동 후 최근 전적 기반 룬 정보로 바뀝니다.'}</small>
           </DetailBlock>
           <DetailBlock icon={<Trophy size={17} />} title="공식 숙련도"><div className="mastery-stat"><div><strong>{selected.masteryLevel}</strong><span>레벨</span></div><div><b>{formatMastery(selected.mastery)}점</b><small>챔피언 숙련도 점수</small></div><div><b>{selected.games}회</b><small>{isLiveData ? '시즌 분석 게임' : '최근 분석 게임'}</small></div></div></DetailBlock>
-          <DetailBlock icon={<Gauge size={17} />} title="숙련도 점수"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong>{selected.fit && <span className={`fit-chip ${selected.fit.delta >= 0 ? 'up' : 'down'}`} title={`내 ${laneLabels[selected.lane]} 다른 챔피언 ${selected.fit.games}판 평균 ${selected.fit.baseline}점 기준`}>내 {laneLabels[selected.lane]} 평균 대비 {selected.fit.delta > 0 ? '+' : ''}{selected.fit.delta}점</span>}<p>최근 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label} title={metric.detail}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
+          <DetailBlock icon={<Gauge size={17} />} title="숙련도 점수"><div className="ai-summary"><div className="score-ring" style={{ '--score': `${selected.aiScore ?? 0}%` } as CSSProperties}><b>{selected.aiScore ?? '—'}</b><small>점</small></div><div><strong>{aiGrade(selected.aiScore)}</strong>{selected.fit && <span className={`fit-chip ${selected.fit.delta >= 0 ? 'up' : 'down'}`} title={`내 ${laneLabels[selected.lane]} 다른 챔피언 ${selected.fit.games}판 평균 ${selected.fit.baseline}점 기준`}>내 {laneLabels[selected.lane]} 평균 대비 {selected.fit.delta > 0 ? '+' : ''}{selected.fit.delta}점</span>}<p>시즌 승률 {selected.winRate ?? '—'}% · 최근 플레이 {selected.lastPlayed}</p><div className="metric-tags">{selected.metrics.map((metric) => <span className={metric.tone} key={metric.label} title={metric.detail}>{metric.label} <b>{metric.value}</b></span>)}</div></div></div>
             {selected.analysisNote && <p className="analysis-note"><CircleAlert size={13} /> {selected.analysisNote}</p>}
             <div className="insight-grid"><Insight title="강점" icon={<Check size={15} />} values={selected.strengths} tone="good" /><Insight title="개선할 점" icon={<Flame size={15} />} values={selected.improvements} tone="warn" /></div>
             {selected.scoreBreakdown && <ScoreBreakdown items={selected.scoreBreakdown} note={selected.scoreNote} />}

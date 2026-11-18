@@ -75,4 +75,10 @@ select option:checked { background: #26364f; color: #fff; }
 .link-tag { display: inline-block; margin-top: 5px; padding: 2px 7px; border-radius: 4px; background: #293448; color: #a9b4c3; font-size: 10px; }
 .link-tag.linked { background: #19352e; color: #9fcdbd; }
 .onboarding-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.profile-stats { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.profile-stat { min-width: 128px; padding: 9px 14px; background: #162135; border: 1px solid #27344b; border-radius: 8px; }
+.profile-stat small { display: block; color: #8491a5; font-size: 10px; }
+.profile-stat strong { display: block; margin-top: 3px; color: #e4ebf6; font-size: 16px; letter-spacing: -.02em; }
+.profile-stat span { display: block; margin-top: 2px; color: #8290a5; font-size: 10px; }
+@media (max-width: 1000px) { .profile-stats { width: 100%; margin-left: 0; } .profile-stat { flex: 1; } }
 

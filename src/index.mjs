@@ -315,6 +315,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     job.result = {
       account: { puuid: account.puuid, gameName: account.gameName, tagLine: account.tagLine, rank: ranked ? `${ranked.tier} ${ranked.rank} ${ranked.leaguePoints}LP` : '랭크 정보 없음' },
       champions: championStats,
+      totals: { games: matches.length, wins: matches.filter((match) => match.info.participants.find((participant) => participant.puuid === account.puuid)?.win).length },
       syncedAt: new Date().toISOString(),
       matchCount: matches.length,
       seasonStart: new Date(startTime * 1000).toISOString(),
