@@ -439,8 +439,8 @@ export default function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Chamlog 홈"><span>CHAM</span>LOG <i /></a>
         <div className="header-actions">
-          {isAdmin && <button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터</button>}
-          {isAdmin && <button className="ghost-button" onClick={() => setUserModalOpen(true)}><Users size={17} /> 사용자 관리</button>}
+          {isAdmin && <button className="ghost-button" onClick={() => setDataModalOpen(true)} aria-label="저장 데이터 관리" title="저장 데이터 관리"><Database size={17} /><span className="btn-label">저장 데이터</span></button>}
+          {isAdmin && <button className="ghost-button" onClick={() => setUserModalOpen(true)} aria-label="사용자 관리" title="사용자 관리"><Users size={17} /><span className="btn-label">사용자 관리</span></button>}
           <ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} />
         </div>
       </header>
