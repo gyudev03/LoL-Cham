@@ -89,6 +89,12 @@ function formatDuration(totalSeconds: number) {
   return minutes ? `${minutes}분 ${seconds % 60}초` : `${seconds}초`
 }
 
+// 기본 선택: 선호 라인에서 숙련도 점수가 가장 높은 챔피언, 그 라인에 없으면 전체에서 가장 높은 챔피언
+function topChampion(list: Champion[], preferredLane?: Lane) {
+  const best = (items: Champion[]) => items.reduce<Champion | undefined>((top, item) => !top || (item.aiScore ?? -1) > (top.aiScore ?? -1) ? item : top, undefined)
+  return (preferredLane && best(list.filter((item) => item.lane === preferredLane))) || best(list)
+}
+
 function tierClass(tier: Champion['tier']) { return `tier tier-${tier.toLowerCase()}` }
 function championEntryId(champion: Champion) { return champion.entryId ?? champion.id }
 function aiGrade(score: number | null) {
@@ -211,7 +217,7 @@ export default function App() {
 
   function switchLane(nextLane: Lane) {
     setLane(nextLane)
-    const first = championData.find((champion) => champion.lane === nextLane)
+    const first = topChampion(championData.filter((champion) => champion.lane === nextLane))
     if (first) setSelectedId(championEntryId(first))
   }
 
@@ -255,7 +261,7 @@ export default function App() {
       }
       setChampionData(payload.champions)
       setLiveData(true)
-      const preferred = payload.champions.find((champion: Champion) => champion.lane === targetProfile.lane) ?? payload.champions[0]
+      const preferred = topChampion(payload.champions, targetProfile.lane) as Champion
       setLane(preferred.lane)
       setSelectedId(championEntryId(preferred))
     } catch (error) {
@@ -300,7 +306,7 @@ export default function App() {
           .catch((error) => setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.'))
         return nextProfiles
       })
-      const preferred = result.champions.find((champion: Champion) => champion.lane === lane) ?? result.champions[0]
+      const preferred = topChampion(result.champions, lane) as Champion
       setLane(preferred.lane)
       setSelectedId(championEntryId(preferred))
     } catch (error) {
