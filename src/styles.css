@@ -83,3 +83,18 @@ select option:checked { background: #26364f; color: #fff; }
 @media (max-width: 1000px) { .profile-stats { width: 100%; margin-left: 0; } .profile-stat { flex: 1; } }
 .champion-row b.fit-delta.up { color: #7fd8b3; }
 .champion-row b.fit-delta.down { color: #f09aa0; }
+.recent-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.recent-summary b { font-size: 13px; }
+.recent-summary .fit-chip { margin: 0; }
+.recent-dots { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0 8px; }
+.recent-dots span { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; font-size: 10px; font-weight: 700; cursor: default; }
+.recent-dots .win { background: #1d3b33; color: #7fd8b3; }
+.recent-dots .loss { background: #3a2a2d; color: #f09aa0; }
+.bulk-progress { margin-top: 12px; }
+.bulk-progress p { margin: 8px 0; color: #adbacb; font-size: 12px; line-height: 1.5; }
+.bulk-bar { height: 6px; overflow: hidden; border-radius: 3px; background: #243146; }
+.bulk-bar i { display: block; height: 100%; background: #d5a855; transition: width .3s; }
+.bulk-sync .primary-button { margin-top: 12px; }
+.bulk-failures { align-items: flex-start; }
+.bulk-failures p { margin: 0 0 3px; }
+
