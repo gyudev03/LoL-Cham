@@ -4,6 +4,7 @@ import express from 'express'
 import { timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { evaluateChampion, computeFit } from './scoring.mjs'
 
 const app = express()
 const PORT = Number(process.env.PORT || 8787)
@@ -140,8 +141,6 @@ async function getChampionCatalog() {
 const laneByTeamPosition = { TOP: 'TOP', JUNGLE: 'JUNGLE', MIDDLE: 'MID', BOTTOM: 'BOTTOM', UTILITY: 'SUPPORT' }
 const laneLabel = { TOP: '탑', JUNGLE: '정글', MID: '미드', BOTTOM: '원딜', SUPPORT: '서포터' }
 
-function clamp(value, min, max) { return Math.min(max, Math.max(min, value)) }
-function scoreBetween(value, low, high) { return clamp(((value - low) / (high - low)) * 100, 0, 100) }
 function daysAgo(timestamp) { return Math.max(0, Math.floor((Date.now() - timestamp) / 86400000)) }
 function lastPlayedLabel(timestamp) { const days = daysAgo(timestamp); return days === 0 ? '오늘' : `${days}일 전` }
 function asPercent(value) { return Math.round(value * 10) / 10 }
@@ -196,48 +195,6 @@ function mostPlayedRunes(games, runeById) {
     winRate: Math.round((mostPlayed.wins / mostPlayed.games) * 100),
   }
 }
-// ── AI 숙련도 점수 기준 ─────────────────────────────────────────────
-// 100점 = 역할 지표 50 + 승률 20 + 플레이 빈도 15 + 표본 신뢰도 15
-// 각 역할 지표는 low(0점) ~ high(만점) 구간에서 선형으로 환산하고, weight 비율로 역할 지표 50점을 나눠 가진다.
-// good/ok는 '상·양호', '보통' 표시 기준이다. 티어 평균과 비교한 값이 아니라 이 앱이 정한 고정 기준이다.
-const ROLE_POINTS = 50
-const WIN_RATE_POINTS = 20
-const FREQUENCY_POINTS = 15
-const RELIABILITY_POINTS = 15
-const WIN_RATE_RANGE = [30, 70]
-const FREQUENCY_FULL_GAMES = 12
-const RELIABILITY_FULL_GAMES = 20
-const METRIC_DEFINITIONS = {
-  jungleCs10: { label: '초반 정글링', subject: '10분 전 정글 CS', unit: '개', digits: 1, strong: '초반 동선이 안정적입니다.', weak: '낮은 편입니다. 첫 클리어 동선과 캠프 리젠 타이밍을 점검해 보세요.' },
-  killParticipation: { label: '킬 관여', subject: '킬 관여율', unit: '%', digits: 0, strong: '팀 교전에 꾸준히 참여합니다.', weak: '낮은 편입니다. 오브젝트와 교전 타이밍에 합류하는 횟수를 늘려 보세요.' },
-  damagePerMinute: { label: '교전 기여', subject: '분당 피해량', unit: '', digits: 0, strong: '교전 기여가 높습니다.', weak: '낮은 편입니다. 교전에서 딜을 넣을 수 있는 위치를 점검해 보세요.' },
-  visionPerMinute: { label: '시야 관리', subject: '분당 시야 점수', unit: '', digits: 1, strong: '시야 장악이 좋습니다.', weak: '낮은 편입니다. 오브젝트 전 와드 설치와 제거를 늘려 보세요.' },
-  controlWards: { label: '제어 와드', subject: '경기당 제어 와드', unit: '개', digits: 1, strong: '제어 와드를 꾸준히 구매합니다.', weak: '적은 편입니다. 귀환할 때마다 1개씩 구매해 보세요.' },
-  csPerMinute: { label: 'CS 수급', subject: '분당 CS', unit: '', digits: 1, strong: '라인 수급이 안정적입니다.', weak: '낮은 편입니다. 막타 연습과 웨이브 관리를 점검해 보세요.' },
-  goldPerMinute: { label: '골드 수급', subject: '분당 골드', unit: '', digits: 0, strong: '성장 속도가 빠릅니다.', weak: '낮은 편입니다. 초반 CS와 오브젝트 참여로 성장 속도를 높여 보세요.' },
-  laneDamage: { label: '전투 기여', subject: '분당 피해량', unit: '', digits: 0, strong: '교전 기여가 높습니다.', weak: '낮은 편입니다. 교전에서 딜을 넣을 수 있는 위치를 점검해 보세요.' },
-}
-// ok가 있으면 '상/보통/보완 필요' 3단계, 없으면 '양호/보완 필요' 2단계
-const ROLE_METRICS = {
-  JUNGLE: [
-    { key: 'jungleCs10', weight: .35, low: 10, high: 35, good: 25, ok: 17 },
-    { key: 'killParticipation', weight: .4, low: 30, high: 75, good: 55, ok: 40 },
-    { key: 'damagePerMinute', weight: .25, low: 250, high: 750, good: 500 },
-  ],
-  SUPPORT: [
-    { key: 'visionPerMinute', weight: .45, low: .6, high: 2.8, good: 1.8, ok: 1.1 },
-    { key: 'killParticipation', weight: .35, low: 35, high: 80, good: 60, ok: 45 },
-    { key: 'controlWards', weight: .2, low: 2, high: 10, good: 5 },
-  ],
-  DEFAULT: [
-    { key: 'csPerMinute', weight: .4, low: 4, high: 8, good: 6.5, ok: 5 },
-    { key: 'goldPerMinute', weight: .3, low: 260, high: 480, good: 390 },
-    { key: 'laneDamage', weight: .3, low: 280, high: 850, good: 500 },
-  ],
-}
-function formatMetric(definition, value) { return `${value.toFixed(definition.digits)}${definition.unit}` }
-function round1(value) { return Math.round(value * 10) / 10 }
-
 function buildChampionStats(matches, masteries, catalog, meta = null) {
   const byChampion = new Map()
   for (const match of matches) {
@@ -247,71 +204,19 @@ function buildChampionStats(matches, masteries, catalog, meta = null) {
     const lane = laneByTeamPosition[participant.teamPosition] || laneByTeamPosition[participant.individualPosition]
     if (!lane) continue
     const championLaneKey = `${participant.championId}:${lane}`
-    const current = byChampion.get(championLaneKey) || { championId: participant.championId, lane, games: [], wins: 0 }
-    current.games.push({ participant, createdAt: match.info.gameCreation })
-    current.wins += participant.win ? 1 : 0
+    const current = byChampion.get(championLaneKey) || { championId: participant.championId, lane, games: [] }
+    current.games.push({ participant, info: match.info, createdAt: match.info.gameCreation })
     byChampion.set(championLaneKey, current)
   }
 
   const masteryById = new Map(masteries.map((mastery) => [mastery.championId, mastery]))
-  return [...byChampion.values()].map((entry) => {
+  const results = [...byChampion.values()].map((entry) => {
     const catalogItem = catalog.byKey.get(entry.championId)
     if (!catalogItem) return null
     const games = entry.games.sort((a, b) => b.createdAt - a.createdAt)
     const count = games.length
-    const winRate = asPercent((entry.wins / count) * 100)
-    const avg = (key) => games.reduce((total, game) => total + (game.participant[key] || 0), 0) / count
-    const avgChallenge = (key) => games.reduce((total, game) => total + (game.participant.challenges?.[key] || 0), 0) / count
-    const averageMinutes = Math.max(games.reduce((total, game) => total + game.participant.timePlayed, 0) / count / 60, 1)
-    const avgCsPerMinute = (avg('totalMinionsKilled') + avg('neutralMinionsKilled')) / averageMinutes
-    const avgDamagePerMinute = avgChallenge('damagePerMinute')
-    const avgGoldPerMinute = avgChallenge('goldPerMinute')
-    const avgKillParticipation = avgChallenge('killParticipation') * 100
-    const avgVisionPerMinute = avgChallenge('visionScorePerMinute') || avg('visionScore') / averageMinutes
-    const avgControlWards = avg('visionWardsBoughtInGame')
-    const avgJungleCsBefore10 = avgChallenge('jungleCsBefore10Minutes')
-
-    const measured = {
-      jungleCs10: avgJungleCsBefore10, killParticipation: avgKillParticipation, damagePerMinute: avgDamagePerMinute,
-      visionPerMinute: avgVisionPerMinute, controlWards: avgControlWards,
-      csPerMinute: avgCsPerMinute, goldPerMinute: avgGoldPerMinute, laneDamage: avgDamagePerMinute,
-    }
-    const evaluated = (ROLE_METRICS[entry.lane] || ROLE_METRICS.DEFAULT).map((rule) => {
-      const definition = METRIC_DEFINITIONS[rule.key]
-      const value = measured[rule.key]
-      const score = scoreBetween(value, rule.low, rule.high)
-      const threeStep = rule.ok !== undefined
-      const tone = value >= rule.good ? 'good' : threeStep && value >= rule.ok ? 'neutral' : 'warn'
-      const shown = formatMetric(definition, value)
-      return {
-        definition, rule, value, score, tone, shown,
-        points: (score * rule.weight * ROLE_POINTS) / 100,
-        detail: `${definition.subject} ${shown} (기준 ${formatMetric(definition, rule.low)}~${formatMetric(definition, rule.high)})`,
-      }
-    })
-    const metrics = evaluated.map((item) => ({
-      label: item.definition.label, tone: item.tone, detail: item.detail,
-      value: item.tone === 'good' ? (item.rule.ok !== undefined ? '상' : '양호') : item.tone === 'neutral' ? '보통' : '보완 필요',
-    }))
-    const winPoints = (scoreBetween(winRate, WIN_RATE_RANGE[0], WIN_RATE_RANGE[1]) * WIN_RATE_POINTS) / 100
-    const frequencyPoints = clamp(count / FREQUENCY_FULL_GAMES, 0, 1) * FREQUENCY_POINTS
-    const reliabilityPoints = clamp(count / RELIABILITY_FULL_GAMES, 0, 1) * RELIABILITY_POINTS
-    const totalPoints = evaluated.reduce((total, item) => total + item.points, 0) + winPoints + frequencyPoints + reliabilityPoints
-    const aiScore = count < 5 ? null : Math.round(totalPoints)
-    const scoreBreakdown = aiScore === null ? undefined : [
-      ...evaluated.map((item) => ({ label: item.definition.label, points: round1(item.points), max: round1(item.rule.weight * ROLE_POINTS), detail: item.detail })),
-      { label: '승률', points: round1(winPoints), max: WIN_RATE_POINTS, detail: `${count}판 ${winRate}% (기준 ${WIN_RATE_RANGE[0]}%~${WIN_RATE_RANGE[1]}%)` },
-      { label: '플레이 빈도', points: round1(frequencyPoints), max: FREQUENCY_POINTS, detail: `${count}판 (${FREQUENCY_FULL_GAMES}판 이상이면 만점)` },
-      { label: '표본 신뢰도', points: round1(reliabilityPoints), max: RELIABILITY_POINTS, detail: `${count}판 (${RELIABILITY_FULL_GAMES}판 이상이면 만점)` },
-    ]
-    const strengths = evaluated.filter((item) => item.tone === 'good').sort((a, b) => b.score - a.score).slice(0, 3)
-      .map((item) => `${item.definition.subject} ${item.shown} — ${item.definition.strong}`)
-    const improvements = evaluated.filter((item) => item.tone === 'warn').sort((a, b) => a.score - b.score).slice(0, 3)
-      .map((item) => `${item.definition.subject} ${item.shown} — ${item.definition.weak}`)
-    if (count >= 10 && winRate >= 55) strengths.push(`${count}판 승률 ${winRate}% — 결과도 좋습니다.`)
-    if (count >= 10 && winRate <= 45) improvements.push(`${count}판 승률 ${winRate}% — 패배 경기에서 반복되는 원인을 복기해 보세요.`)
-    if (aiScore !== null && !strengths.length) strengths.push('기준을 넘긴 강점 지표는 아직 없습니다.')
-    if (aiScore !== null && !improvements.length) improvements.push('보완이 필요한 지표는 없습니다.')
+    const winRate = asPercent((games.filter((game) => game.participant.win).length / count) * 100)
+    const evaluation = evaluateChampion(entry.lane, games)
     const mastery = masteryById.get(entry.championId)
     const metaEntry = meta?.champions?.[`${entry.championId}:${entry.lane}`]
     const counterNames = (list) => (list || []).map((counter) => typeof counter === 'string' ? counter : catalog.byKey.get(counter.id)?.name).filter(Boolean)
@@ -322,15 +227,18 @@ function buildChampionStats(matches, masteries, catalog, meta = null) {
       id: catalogItem.id, entryId: `${catalogItem.id}:${entry.lane}`, name: catalogItem.name, lane: entry.lane,
       image: `${DDRAGON}/cdn/${catalog.version}/img/champion/${catalogItem.image.full}`,
       tier: metaEntry?.tier ?? '—', mastery: mastery?.championPoints || 0, masteryLevel: mastery?.championLevel || 0,
-      aiScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
-      analysisNote: count >= 5 && count < 10 ? `이번 시즌 분석 게임이 ${count}판입니다. 게임 수가 적어 AI 숙련도 결과가 정확하지 않을 수 있습니다.` : undefined,
+      aiScore: evaluation.aiScore, rawScore: evaluation.rawScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
+      analysisNote: evaluation.analysisNote, scoreNote: evaluation.scoreNote,
       runeInfo: mostPlayedRunes(games, catalog.runeById),
       counters: { good: goodCounters.length ? goodCounters : emptyCounter, difficult: difficultCounters.length ? difficultCounters : emptyCounter },
-      strengths: aiScore === null ? ['분석을 위한 최소 5게임이 필요합니다.'] : strengths,
-      improvements: aiScore === null ? ['게임 수가 쌓이면 개선할 점을 알려드립니다.'] : improvements,
-      metrics, scoreBreakdown,
+      strengths: evaluation.strengths, improvements: evaluation.improvements,
+      metrics: evaluation.metrics, scoreBreakdown: evaluation.scoreBreakdown,
     }
   }).filter(Boolean)
+
+  // 적합도: 같은 라인의 다른 챔피언 평균 원점수와의 차이
+  const fits = computeFit(results.map((item) => ({ key: item.entryId, lane: item.lane, count: item.games, rawScore: item.rawScore })))
+  return results.map((item) => ({ ...item, fit: fits.get(item.entryId) ?? null }))
 }
 
 app.get('/api/users', async (_request, response) => {
@@ -372,6 +280,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     const cache = await loadCache()
     const cachedPlayer = cache.players[account.puuid]
     const player = cachedPlayer?.seasonStart === startTime ? cachedPlayer : { seasonStart: startTime, matches: {} }
+    player.account = { gameName: account.gameName, tagLine: account.tagLine }
     cache.players[account.puuid] = player
 
     const [masteries, leagueEntries, catalog, matchIds] = await Promise.all([
@@ -448,6 +357,42 @@ app.get('/api/riot/summary/:puuid', async (request, response) => {
   const summary = cache.players?.[request.params.puuid]?.summary
   if (!summary) return response.status(404).json({ message: '저장된 분석 결과가 없습니다. 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' })
   response.json(summary)
+})
+
+// 이 PC 서버에 저장된 데이터 목록: 사용자 이름(Riot ID)과 저장 현황을 확인한다.
+function playerIdentity(puuid, player) {
+  const account = player.summary?.account || player.account
+  if (account?.gameName) return { gameName: account.gameName, tagLine: account.tagLine || '' }
+  // 요약이 없는 예전 캐시는 저장된 경기 기록에서 이름을 찾는다.
+  for (const match of Object.values(player.matches || {})) {
+    const participant = match?.info?.participants?.find((item) => item.puuid === puuid)
+    if (participant?.riotIdGameName) return { gameName: participant.riotIdGameName, tagLine: participant.riotIdTagline || '' }
+  }
+  return { gameName: '', tagLine: '' }
+}
+
+app.get('/api/riot/cache', async (_request, response) => {
+  const cache = await loadCache()
+  const players = Object.entries(cache.players || {}).map(([puuid, player]) => ({
+    puuid,
+    ...playerIdentity(puuid, player),
+    matchCount: Object.keys(player.matches || {}).length,
+    hasSummary: Boolean(player.summary),
+    championCount: player.summary?.champions?.length ?? 0,
+    syncedAt: player.summary?.syncedAt ?? null,
+  }))
+  response.json({ players })
+})
+
+app.delete('/api/riot/cache/:puuid', async (request, response) => {
+  if ([...syncJobs.values()].some((job) => job.status === 'queued' || job.status === 'running')) {
+    return response.status(409).json({ message: '동기화가 진행 중입니다. 끝나거나 취소된 뒤 다시 삭제하세요.' })
+  }
+  const cache = await loadCache()
+  if (!cache.players?.[request.params.puuid]) return response.status(404).json({ message: '삭제할 저장 데이터를 찾지 못했습니다.' })
+  delete cache.players[request.params.puuid]
+  await saveCache(cache)
+  response.json({ ok: true })
 })
 
 app.delete('/api/riot/sync/:jobId', (request, response) => {

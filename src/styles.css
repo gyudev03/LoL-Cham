@@ -62,3 +62,17 @@ select option:checked { background: #26364f; color: #fff; }
 .fit-chip { display: inline-block; margin: 5px 0 0; padding: 2px 8px; border-radius: 10px; font: 700 10px 'DM Mono'; background: #273449; color: #b7c5d8; }
 .fit-chip.up { background: #1d3b33; color: #7fd8b3; }
 .fit-chip.down { background: #3a2a2d; color: #f09aa0; }
+.user-delete { display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 6px 8px; color: #e0a39b; background: #2e2026; border: 0; border-radius: 5px; font-size: 10px; flex-shrink: 0; transition: .2s; }
+.user-delete:hover:not(:disabled) { background: #4a2a31; color: #ffd2cc; }
+.user-delete:disabled { opacity: .45; cursor: not-allowed; }
+.user-delete.with-label { margin-left: auto; }
+.data-section { margin-top: 22px; }
+.data-section h3 { margin: 0; font-size: 13px; color: #d5deeb; }
+.data-section h3 small { margin-left: 6px; color: #8190a5; font-weight: 400; }
+.data-section .user-rows { margin-top: 10px; }
+.data-empty { margin: 10px 0 0; color: #8b99ad; font-size: 12px; }
+.tag-suffix { color: #8190a5; font-weight: 400; margin-left: 2px; }
+.link-tag { display: inline-block; margin-top: 5px; padding: 2px 7px; border-radius: 4px; background: #293448; color: #a9b4c3; font-size: 10px; }
+.link-tag.linked { background: #19352e; color: #9fcdbd; }
+.onboarding-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+

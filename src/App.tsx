@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth'
-import { collection, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
 import {
   Check, ChevronDown, ChevronUp, CircleAlert, Flame, Gauge, Plus, RefreshCw,
-  Pencil, Search, Settings2, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload,
+  Pencil, Search, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload, Trash2, Database,
 } from 'lucide-react'
 import { auth, db, googleProvider } from './firebase'
 
@@ -56,6 +56,11 @@ type Champion = {
   scoreBreakdown?: { label: string; points: number; max: number; detail: string }[]
 }
 
+type LocalCacheEntry = {
+  puuid: string; gameName: string; tagLine: string
+  matchCount: number; hasSummary: boolean; championCount: number; syncedAt: string | null
+}
+
 type SyncResult = {
   champions: Champion[]
   account: { puuid: string; gameName: string; tagLine: string }
@@ -63,6 +68,7 @@ type SyncResult = {
 }
 
 const sharedProfiles = collection(db, 'shared', 'chamlog', 'profiles')
+const summariesCol = collection(db, 'shared', 'chamlog', 'summaries')
 const summaryRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', String(profileId))
 const syncApiBase = import.meta.env.VITE_SYNC_API_URL || '/api'
 const hasSyncServer = window.location.hostname === 'localhost' || Boolean(import.meta.env.VITE_SYNC_API_URL)
@@ -93,6 +99,34 @@ function aiGrade(score: number | null) {
   return '보완 필요'
 }
 
+// 저장된 분석 데이터는 사용자 ID가 아니라 Riot 계정(puuid, 없으면 Riot ID#태그)으로 사용자와 연결한다.
+// 그래서 사용자를 삭제했다가 같은 Riot ID로 다시 추가해도 기존 분석 데이터를 그대로 쓸 수 있다.
+type AccountLike = { puuid?: string; gameName?: string; tagLine?: string }
+const normalizeRiotId = (value?: string) => (value ?? '').normalize('NFC').replace(/\s+/g, '').toLowerCase()
+function accountMatchesProfile(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>, account?: AccountLike | null) {
+  if (!account) return false
+  if (target.puuid && account.puuid) return target.puuid === account.puuid
+  const name = normalizeRiotId(account.gameName)
+  return Boolean(name) && name === normalizeRiotId(target.riotId) && normalizeRiotId(account.tagLine) === normalizeRiotId(target.tag)
+}
+async function resolveSummaryRef(target: Pick<Profile, 'id' | 'puuid' | 'riotId' | 'tag'>) {
+  const direct = summaryRef(target.id)
+  if ((await getDoc(direct)).exists()) return direct
+  const snapshot = await getDocs(summariesCol)
+  const matched = snapshot.docs.find((item) => accountMatchesProfile(target, (item.data() as SyncResult).account))
+  return matched ? matched.ref : direct
+}
+async function findLocalPuuid(target: Profile) {
+  try {
+    const response = await fetch(`${syncApiBase}/riot/cache`)
+    if (!response.ok) return undefined
+    const payload = await response.json() as { players?: LocalCacheEntry[] }
+    return payload.players?.find((item) => accountMatchesProfile(target, item))?.puuid
+  } catch {
+    return undefined
+  }
+}
+
 function profileFromStorage(item: Omit<Profile, 'syncedAt'> & { syncedAt?: string | Date }) {
   return { ...item, syncedAt: item.syncedAt ? new Date(item.syncedAt) : new Date(0) }
 }
@@ -113,6 +147,7 @@ export default function App() {
   const [championData, setChampionData] = useState<Champion[]>([])
   const [sortBy, setSortBy] = useState<'ai' | 'mastery' | 'win'>('ai')
   const [isUserModalOpen, setUserModalOpen] = useState(false)
+  const [isDataModalOpen, setDataModalOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
   const [syncProgress, setSyncProgress] = useState('')
@@ -186,21 +221,38 @@ export default function App() {
     setSelectedId('')
     setLiveData(false)
     try {
-      const sharedSummary = await getDoc(summaryRef(targetProfile.id))
-      let payload = sharedSummary.exists() ? sharedSummary.data() as SyncResult : null
-      setSharedData(sharedSummary.exists())
+      let payload: SyncResult | null = null
+      const directSummary = await getDoc(summaryRef(targetProfile.id))
+      if (directSummary.exists()) {
+        payload = directSummary.data() as SyncResult
+      } else {
+        // 사용자 ID로 저장된 데이터가 없으면 같은 Riot 계정으로 저장된 데이터를 찾는다.
+        const snapshot = await getDocs(summariesCol)
+        const matched = snapshot.docs.find((item) => accountMatchesProfile(targetProfile, (item.data() as SyncResult).account))
+        if (matched) payload = matched.data() as SyncResult
+      }
+      setSharedData(Boolean(payload))
       setLocalOnlyData(false)
-      if (!payload && targetProfile.puuid) {
-        const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(targetProfile.puuid)}`)
-        if (response.ok) {
-          payload = await response.json() as SyncResult
-          setLocalOnlyData(true)
-        } else if (response.status !== 404) {
-          const body = await response.json().catch(() => ({}))
-          throw new Error(body.message || '저장된 분석 데이터를 불러오지 못했습니다.')
+      if (!payload) {
+        const puuid = targetProfile.puuid || (hasSyncServer ? await findLocalPuuid(targetProfile) : undefined)
+        if (puuid) {
+          const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(puuid)}`)
+          if (response.ok) {
+            payload = await response.json() as SyncResult
+            setLocalOnlyData(true)
+          } else if (response.status !== 404) {
+            const body = await response.json().catch(() => ({}))
+            throw new Error(body.message || '저장된 분석 데이터를 불러오지 못했습니다.')
+          }
         }
       }
       if (!payload?.champions?.length) return
+      const loaded = payload
+      if (loaded.account?.puuid && !targetProfile.puuid && accountMatchesProfile(targetProfile, loaded.account)) {
+        setProfiles((current) => current.map((item) => item.id === targetProfile.id && !item.puuid
+          ? { ...item, puuid: loaded.account.puuid, syncedAt: loaded.syncedAt ? new Date(loaded.syncedAt) : item.syncedAt }
+          : item))
+      }
       setChampionData(payload.champions)
       setLiveData(true)
       const preferred = payload.champions.find((champion: Champion) => champion.lane === targetProfile.lane) ?? payload.champions[0]
@@ -240,8 +292,10 @@ export default function App() {
       setLiveData(true)
       setProfiles((current) => {
         const nextProfiles = current.map((item) => item.id === targetProfile.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) } : item)
+        const updatedProfile = nextProfiles.find((item) => item.id === targetProfile.id) ?? targetProfile
         void persistProfiles(nextProfiles)
-          .then(() => setDoc(summaryRef(targetProfile.id), result))
+          .then(() => resolveSummaryRef(updatedProfile))
+          .then((ref) => setDoc(ref, result))
           .then(() => { setSharedData(true); setLocalOnlyData(false) })
           .catch((error) => setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.'))
         return nextProfiles
@@ -276,9 +330,13 @@ export default function App() {
   async function saveUserProfiles(nextProfiles: Profile[]) {
     setProfileError('')
     await persistProfiles(nextProfiles)
+    // 삭제한 사용자 문서만 지운다. 저장된 분석 데이터(summaries)는 건드리지 않는다.
+    const removed = profiles.filter((old) => !nextProfiles.some((item) => item.id === old.id))
+    await Promise.all(removed.map((old) => deleteDoc(doc(sharedProfiles, String(old.id)))))
     setProfiles(nextProfiles)
     const nextActive = nextProfiles.find((item) => item.id === profileId && item.active) ?? nextProfiles.find((item) => item.active)
     if (nextActive) { setProfileId(nextActive.id); setLane(nextActive.lane); void loadCachedData(nextActive) }
+    else if (!nextProfiles.some((item) => item.id === profileId)) { setProfileId(null); setChampionData([]); setSelectedId(''); setLiveData(false) }
     setUserModalOpen(false)
   }
 
@@ -286,7 +344,7 @@ export default function App() {
     if (!profile || !isAdmin || !championData.length) return
     try {
       await persistProfiles(profiles)
-      await setDoc(summaryRef(profile.id), {
+      await setDoc(await resolveSummaryRef(profile), {
         account: { puuid: profile.puuid || '', gameName: profile.riotId, tagLine: profile.tag },
         champions: championData,
         syncedAt: profile.syncedAt.toISOString(),
@@ -339,7 +397,7 @@ export default function App() {
   }
 
   if (!profile) {
-    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}</main>
+    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <div className="onboarding-actions"><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button><button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터 관리</button></div>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}{isDataModalOpen && isAdmin && <DataModal profiles={profiles} onClose={() => setDataModalOpen(false)} onChanged={() => undefined} />}</main>
   }
 
   return (
@@ -347,6 +405,7 @@ export default function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Chamlog 홈"><span>CHAM</span>LOG <i /></a>
         <div className="header-actions">
+          {isAdmin && <button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터</button>}
           {isAdmin && <button className="ghost-button" onClick={() => setUserModalOpen(true)}><Users size={17} /> 사용자 관리</button>}
           <ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} />
         </div>
@@ -371,7 +430,6 @@ export default function App() {
           </select><ChevronDown size={16} /></div>
         </div>
         <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div><strong>{profile.riotId}<span>#{profile.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></div></div>
-        {isAdmin && <button className="profile-edit" onClick={() => setUserModalOpen(true)}><Settings2 size={16} /> 사용자 정보 관리</button>}
       </section>
 
       <nav className="lane-tabs" aria-label="라인 선택">
@@ -411,6 +469,7 @@ export default function App() {
       </section>
 
       {isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}
+      {isDataModalOpen && isAdmin && <DataModal profiles={profiles} onClose={() => setDataModalOpen(false)} onChanged={() => void loadCachedData(profile)} />}
     </main>
   )
 }
@@ -466,6 +525,11 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     setEditingId(user.id)
     setAdding(true)
   }
+  function removeUser(user: Profile) {
+    if (!window.confirm(`'${user.name}' (${user.riotId}#${user.tag}) 사용자를 삭제할까요?\n\n저장된 분석 데이터는 삭제되지 않습니다. 같은 Riot ID로 다시 추가하면 기존 분석 데이터를 그대로 사용합니다.\n\n'변경사항 저장'을 눌러야 삭제가 반영됩니다.`)) return
+    setRows((current) => current.filter((row) => row.id !== user.id))
+    if (editingId === user.id) { setEditingId(null); setAdding(false); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }
+  }
   function move(index: number, delta: number) {
     setRows((current) => {
       const target = index + delta
@@ -495,10 +559,100 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     setSaveError('')
     try { await onSave(rows.map((row, index) => ({ ...row, order: index }))) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
   }
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다.</p>
-    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button></div>)}</div>
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다. 사용자를 삭제해도 저장된 분석 데이터는 남으며, 같은 Riot ID로 다시 추가하면 그대로 사용할 수 있습니다.</p>
+    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button><button className="user-delete" onClick={() => removeUser(user)} disabled={isSaving} aria-label={`${user.name} 사용자 삭제`} title="사용자 삭제"><Trash2 size={14} /></button></div>)}</div>
     {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><input placeholder="Riot ID" value={form.riotId} onChange={(e) => setForm({ ...form, riotId: e.target.value })} /><input placeholder="태그 (예: KR1)" value={form.tag} onChange={(e) => setForm({ ...form, tag: e.target.value })} /><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
     {saveError && <p className="modal-error"><CircleAlert size={14} /> {saveError}</p>}
     <div className="modal-actions"><button className="ghost-button" onClick={onClose} disabled={isSaving}>취소</button><button className="primary-button" onClick={save} disabled={isSaving}>{isSaving ? '저장 중' : '변경사항 저장'}</button></div>
+  </div></div>
+}
+
+type SharedDataEntry = { id: string; gameName: string; tagLine: string; championCount: number; syncedAt: string }
+
+function formatDateTime(value: string | null) {
+  const date = value ? new Date(value) : null
+  return date && Number.isFinite(date.getTime()) ? date.toLocaleString('ko-KR', { dateStyle: 'medium', timeStyle: 'short' }) : '기록 없음'
+}
+
+function DataModal({ profiles, onClose, onChanged }: { profiles: Profile[]; onClose: () => void; onChanged: () => void }) {
+  const [shared, setShared] = useState<SharedDataEntry[] | null>(null)
+  const [local, setLocal] = useState<LocalCacheEntry[] | null>(null)
+  const [sharedError, setSharedError] = useState('')
+  const [localError, setLocalError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [busyKey, setBusyKey] = useState('')
+
+  async function load() {
+    try {
+      const snapshot = await getDocs(summariesCol)
+      setShared(snapshot.docs.map((item) => {
+        const data = item.data() as Partial<SyncResult>
+        return { id: item.id, gameName: data.account?.gameName ?? '', tagLine: data.account?.tagLine ?? '', championCount: data.champions?.length ?? 0, syncedAt: data.syncedAt ?? '' }
+      }))
+      setSharedError('')
+    } catch (error) {
+      setSharedError(error instanceof Error ? error.message : '공용 데이터를 불러오지 못했습니다.')
+    }
+    if (!hasSyncServer) return
+    try {
+      const response = await fetch(`${syncApiBase}/riot/cache`)
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.message || '이 PC에 저장된 데이터를 불러오지 못했습니다.')
+      setLocal(payload.players)
+      setLocalError('')
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : '이 PC에 저장된 데이터를 불러오지 못했습니다.')
+    }
+  }
+  useEffect(() => { void load() }, [])
+
+  function linkedUser(entry: { id?: string; puuid?: string; gameName: string; tagLine: string }) {
+    return profiles.find((item) => (entry.id !== undefined && String(item.id) === entry.id) || accountMatchesProfile(item, entry))
+  }
+
+  async function remove(key: string, label: string, warning: string, action: () => Promise<void>) {
+    if (!window.confirm(`${label} 저장 데이터를 삭제할까요?\n\n${warning}\n삭제한 데이터는 되돌릴 수 없습니다.`)) return
+    setBusyKey(key)
+    setActionError('')
+    try {
+      await action()
+      await load()
+      onChanged()
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '저장 데이터를 삭제하지 못했습니다.')
+    } finally {
+      setBusyKey('')
+    }
+  }
+
+  async function removeShared(entry: SharedDataEntry) {
+    await remove(`shared:${entry.id}`, `'${entry.gameName || '이름 없음'}#${entry.tagLine}'의 공용 Firebase`, '모든 사용자가 보는 분석 결과가 사라집니다. 사용자 정보는 삭제되지 않습니다.', () => deleteDoc(doc(summariesCol, entry.id)))
+  }
+
+  async function removeLocal(entry: LocalCacheEntry) {
+    await remove(`local:${entry.puuid}`, `'${entry.gameName || '이름 없음'}#${entry.tagLine}'의 이 PC`, `분석 결과와 저장된 경기 ${entry.matchCount}판이 모두 사라지며, 다시 동기화하면 경기를 처음부터 받아야 해서 오래 걸립니다.`, async () => {
+      const response = await fetch(`${syncApiBase}/riot/cache/${encodeURIComponent(entry.puuid)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).message || '이 PC의 저장 데이터를 삭제하지 못했습니다.')
+    })
+  }
+
+  function UserTag({ user }: { user?: Profile }) {
+    return user ? <span className="link-tag linked">사용자: {user.name}</span> : <span className="link-tag">연결된 사용자 없음</span>
+  }
+
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="저장 데이터 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">분석 결과 저장소</p><h2>저장 데이터 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div>
+    <p className="modal-copy">저장된 분석 데이터가 어떤 Riot 계정의 것인지 확인하고 삭제합니다. 사용자 삭제와는 별개이며, 데이터가 남아 있으면 같은 Riot ID의 사용자를 다시 추가할 때 그대로 연결됩니다.</p>
+    <section className="data-section"><h3>공용 Firebase 데이터 <small>{shared ? `${shared.length}개` : ''}</small></h3>
+      {sharedError && <p className="modal-error"><CircleAlert size={14} /> {sharedError}</p>}
+      {shared && !shared.length && <p className="data-empty">저장된 공용 데이터가 없습니다.</p>}
+      <div className="user-rows">{shared?.map((entry) => <div className="user-row" key={entry.id}><div className="user-initial">{(entry.gameName || '?').slice(0, 1)}</div><div><b>{entry.gameName || '이름 없음'}<span className="tag-suffix">#{entry.tagLine}</span></b><p>챔피언 {entry.championCount}개 · 마지막 동기화 {formatDateTime(entry.syncedAt)}</p><UserTag user={linkedUser(entry)} /></div><button className="user-delete with-label" onClick={() => void removeShared(entry)} disabled={busyKey !== ''}><Trash2 size={14} /> {busyKey === `shared:${entry.id}` ? '삭제 중' : '삭제'}</button></div>)}</div>
+    </section>
+    {hasSyncServer && <section className="data-section"><h3>이 PC 서버 데이터 <small>{local ? `${local.length}개` : ''}</small></h3>
+      {localError && <p className="modal-error"><CircleAlert size={14} /> {localError}</p>}
+      {local && !local.length && <p className="data-empty">이 PC에 저장된 데이터가 없습니다.</p>}
+      <div className="user-rows">{local?.map((entry) => <div className="user-row" key={entry.puuid}><div className="user-initial">{(entry.gameName || '?').slice(0, 1)}</div><div><b>{entry.gameName || '이름 없음'}<span className="tag-suffix">#{entry.tagLine}</span></b><p>저장된 경기 {entry.matchCount}판 · {entry.hasSummary ? `분석 결과 있음 · 마지막 동기화 ${formatDateTime(entry.syncedAt)}` : '분석 결과 없음'}</p><UserTag user={linkedUser(entry)} /></div><button className="user-delete with-label" onClick={() => void removeLocal(entry)} disabled={busyKey !== ''}><Trash2 size={14} /> {busyKey === `local:${entry.puuid}` ? '삭제 중' : '삭제'}</button></div>)}</div>
+    </section>}
+    {actionError && <p className="modal-error"><CircleAlert size={14} /> {actionError}</p>}
+    <div className="modal-actions"><button className="ghost-button" onClick={onClose}>닫기</button></div>
   </div></div>
 }
