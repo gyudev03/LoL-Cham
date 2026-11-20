@@ -5,7 +5,7 @@
 //  - 데이터에 없는 지표는 제외하고 남은 지표로 90점을 다시 나눈다.
 //  - 기준 범위(low~high)는 이 앱이 정한 고정값이다. 티어 평균과 비교한 값이 아니다. low > high이면 낮을수록 좋은 지표다.
 
-export const MIN_GAMES = 5            // 이 판수 미만이면 점수를 매기지 않는다
+export const MIN_GAMES = 5            // 이 판수 미만이면 정식 점수 대신 '참고 점수'만 보여준다(순위·적합도에는 반영하지 않는다)
 export const FULL_TRUST_GAMES = 15    // 이 판수부터 점수를 100% 반영한다
 const PERFORMANCE_POINTS = 90
 const WIN_RATE_POINTS = 10
@@ -21,6 +21,7 @@ export function scoreBetween(value, low, high) { return clamp(((value - low) / (
 const round1 = (value) => Math.round(value * 10) / 10
 const finite = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
 const minutesOf = (participant) => Math.max((finite(participant.timePlayed) ?? 0) / 60, 1)
+const perMinute = (value, participant) => (finite(value) !== null && finite(participant.timePlayed) !== null ? value / minutesOf(participant) : null)
 
 // 오브젝트 관여율: 그 판에서 처치된 드래곤·전령·바론 전체(양 팀 합) 중, 내가 개입해서 얻은 비율(%).
 // 상대에게 내준 오브젝트도 분모에 들어가므로, 합류가 늦거나 내주는 일이 많으면 낮아진다.
@@ -49,12 +50,12 @@ function killParticipation(participant, info) {
 export const MEASURES = {
   csPerMinute: {
     subject: '분당 CS', unit: '', digits: 1,
-    extract: (p) => ((finite(p.totalMinionsKilled) ?? 0) + (finite(p.neutralMinionsKilled) ?? 0)) / minutesOf(p),
+    extract: (p) => (finite(p.totalMinionsKilled) === null && finite(p.neutralMinionsKilled) === null ? null : perMinute((finite(p.totalMinionsKilled) ?? 0) + (finite(p.neutralMinionsKilled) ?? 0), p)),
     strong: '라인 수급이 안정적입니다.', weak: '낮은 편입니다. 막타 연습과 웨이브 관리를 점검해 보세요.',
   },
   goldPerMinute: {
     subject: '분당 골드', unit: '', digits: 0,
-    extract: (p) => finite(p.challenges?.goldPerMinute) ?? (finite(p.goldEarned) !== null ? p.goldEarned / minutesOf(p) : null),
+    extract: (p) => finite(p.challenges?.goldPerMinute) ?? perMinute(p.goldEarned, p),
     strong: '성장 속도가 빠릅니다.', weak: '낮은 편입니다. 초반 CS와 오브젝트 참여로 성장 속도를 높여 보세요.',
   },
   earlyCs: {
@@ -69,7 +70,7 @@ export const MEASURES = {
   },
   damagePerMinute: {
     subject: '분당 피해량', unit: '', digits: 0,
-    extract: (p) => finite(p.challenges?.damagePerMinute) ?? (finite(p.totalDamageDealtToChampions) !== null ? p.totalDamageDealtToChampions / minutesOf(p) : null),
+    extract: (p) => finite(p.challenges?.damagePerMinute) ?? perMinute(p.totalDamageDealtToChampions, p),
     strong: '교전 기여가 높습니다.', weak: '낮은 편입니다. 교전에서 딜을 넣을 수 있는 위치를 점검해 보세요.',
   },
   // 받은 피해를 '데스당'으로 보면, 의미 없이 죽어서 받은 피해가 많아지는 경우에는 오히려 값이 낮아진다.
@@ -90,7 +91,7 @@ export const MEASURES = {
   },
   visionPerMinute: {
     subject: '분당 시야 점수', unit: '', digits: 1,
-    extract: (p) => finite(p.challenges?.visionScorePerMinute) ?? (finite(p.visionScore) !== null ? p.visionScore / minutesOf(p) : null),
+    extract: (p) => finite(p.challenges?.visionScorePerMinute) ?? perMinute(p.visionScore, p),
     strong: '시야 장악이 좋습니다.', weak: '낮은 편입니다. 오브젝트 전 와드 설치와 제거를 늘려 보세요.',
   },
   controlWards: {
@@ -161,7 +162,7 @@ export function measureOption(option, games) {
   const measure = MEASURES[option.id]
   if (measure.supported && !measure.supported(games)) return null
   const values = games.map((game) => finite(measure.extract(game.participant, game.info))).filter((value) => value !== null)
-  if (values.length < MIN_VALUE_GAMES || values.length / games.length < MIN_VALUE_COVERAGE) return null
+  if (values.length < Math.min(MIN_VALUE_GAMES, games.length) || values.length / games.length < MIN_VALUE_COVERAGE) return null
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length
   return { option, measure, mean, score: scoreBetween(mean, option.low, option.high), shown: formatValue(measure, mean) }
 }
@@ -210,7 +211,9 @@ export function evaluateChampion(lane, games) {
   // 4) 합산과 표본 보정
   const rawScore = Math.round(rows.reduce((sum, row) => sum + row.points, 0) + winPoints)
   const trust = Math.min(1, count / FULL_TRUST_GAMES)
-  const aiScore = count < MIN_GAMES || !rows.length ? null : Math.round(50 + (rawScore - 50) * trust)
+  const analyzable = rows.length > 0
+  const isReference = analyzable && count < MIN_GAMES // 1~4판: 분석은 보여주되 정식 점수로 쓰지 않는다
+  const aiScore = count < MIN_GAMES || !analyzable ? null : Math.round(50 + (rawScore - 50) * trust)
 
   const strengths = rows.filter((row) => row.tone === 'good').sort((a, b) => b.score - a.score).slice(0, 3)
     .map((row) => `${row.chosen.measure.subject} ${row.chosen.shown} — ${row.chosen.measure.strong}`)
@@ -218,21 +221,24 @@ export function evaluateChampion(lane, games) {
     .map((row) => `${row.chosen.measure.subject} ${row.chosen.shown} — ${row.chosen.measure.weak}`)
   if (count >= 10 && winRate >= 55) strengths.push(`${count}판 승률 ${winRate}% — 결과도 좋습니다.`)
   if (count >= 10 && winRate <= 45) improvements.push(`${count}판 승률 ${winRate}% — 패배 경기에서 반복되는 원인을 복기해 보세요.`)
-  if (aiScore !== null && !strengths.length) strengths.push('기준을 넘긴 강점 지표는 아직 없습니다.')
-  if (aiScore !== null && !improvements.length) improvements.push('보완이 필요한 지표는 없습니다.')
+  if (analyzable && !strengths.length) strengths.push('기준을 넘긴 강점 지표는 아직 없습니다.')
+  if (analyzable && !improvements.length) improvements.push('보완이 필요한 지표는 없습니다.')
 
   return {
     aiScore,
     rawScore: aiScore === null ? null : rawScore,
+    referenceScore: isReference ? rawScore : undefined,
     metrics: rows.map((row) => ({ label: row.label, tone: row.tone, detail: row.detail, value: row.tone === 'good' ? '상' : row.tone === 'neutral' ? '보통' : '보완 필요' })),
-    scoreBreakdown: aiScore === null ? undefined : [
+    scoreBreakdown: !analyzable ? undefined : [
       ...rows.map((row) => ({ label: `${row.category} · ${row.label}`, points: round1(row.points), max: round1(row.max), detail: row.detail })),
       { label: '승률(보정)', points: round1(winPoints), max: WIN_RATE_POINTS, detail: `${count}판 ${winRate}% → 보정 ${round1(adjustedWinRate)}% (기준 ${WIN_RATE_RANGE[0]}%~${WIN_RATE_RANGE[1]}%)` },
     ],
-    strengths: aiScore === null ? ['분석을 위한 최소 5게임이 필요합니다.'] : strengths,
-    improvements: aiScore === null ? ['게임 수가 쌓이면 개선할 점을 알려드립니다.'] : improvements,
-    analysisNote: aiScore !== null && trust < 1 ? `표본이 ${count}판이라 점수를 ${Math.round(trust * 100)}%만 반영했습니다 (원점수 ${rawScore}). ${FULL_TRUST_GAMES}판부터 그대로 반영됩니다.` : undefined,
-    scoreNote: aiScore !== null && excluded.length ? `데이터가 없어 제외한 지표: ${[...new Set(excluded)].join(', ')}. 남은 지표로 90점을 다시 나눠 계산했습니다.` : undefined,
+    strengths: analyzable ? strengths : ['분석에 쓸 지표 데이터가 없습니다.'],
+    improvements: analyzable ? improvements : ['데이터가 쌓이면 개선할 점을 알려드립니다.'],
+    analysisNote: isReference
+      ? `표본이 ${count}판뿐이라 참고용입니다. 한두 판의 결과는 우연일 수 있어서 순위와 적합도에는 반영하지 않았어요. ${MIN_GAMES}판부터 점수로 계산하며, 그때는 표본 보정이 들어가 점수가 달라질 수 있습니다.`
+      : analyzable && trust < 1 ? `표본이 ${count}판이라 점수를 ${Math.round(trust * 100)}%만 반영했습니다 (원점수 ${rawScore}). ${FULL_TRUST_GAMES}판부터 그대로 반영됩니다.` : undefined,
+    scoreNote: analyzable && excluded.length ? `데이터가 없어 제외한 지표: ${[...new Set(excluded)].join(', ')}. 남은 지표로 90점을 다시 나눠 계산했습니다.` : undefined,
   }
 }
 
