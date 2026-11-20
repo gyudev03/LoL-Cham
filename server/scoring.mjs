@@ -117,14 +117,17 @@ const growth = (points, cs, gold, early) => ({ label: '성장', points, metrics:
 //  - 데스는 판당으로 센다(약 29분 기준 플래티넘 5.8 · 챌린저 5.5 · 프로 4.6). 9판당 이상이면 0점, 4 이하면 만점.
 //  - 오브젝트 관여율은 '양 팀이 처치한 전체 오브젝트 중 내가 개입한 비율'. 정글 랭커 708판(승률 52%)의 평균이 53%라서, 만점 기준을 60%로 두어 여유를 남겼다.
 //  - 정글 랭커 708판 실측: 10분 전 정글 CS 68.2, 골드 460, 분당 피해량 735, 판당 데스 4.9, 킬 관여율 60% → 각 지표가 76~97%에 오도록 확인했다.
-//  - 정글·서폿·탑은 표본이 적어(12~68판) 잠정값이다. 다른 계정 데이터가 쌓이면 다시 맞춘다.
-const DEATHS = m('deathsPerGame', 9, 4)
+//  - 탑: 챌린저 탑 327판 / 정글: 랭킹 2등 708판, 에메랄드 289판 / 서폿: 마스터 407판 데이터로 확인했다.
+//  - 아직 표본이 없는 구간: 탑·서폿의 중간 티어, 미드의 중상위 티어.
+const DEATHS = m('deathsPerGame', 9, 4)          // 원딜·미드·정글: 랭커 평균 약 4.9
+const DEATHS_TOP = m('deathsPerGame', 9, 5)      // 탑: 챌린저 탑 327판 평균 5.7
+const DEATHS_SUPPORT = m('deathsPerGame', 9, 4.5) // 서폿: 마스터 서폿 407판 평균 5.3
 
 export const LANE_RULES = {
   TOP: [
-    growth(30, [5, 8.5], [320, 450], [50, 85]),
-    { label: '전투', points: 35, metrics: [FRONTLINE(400, 900)] },
-    { label: '생존', points: 25, metrics: [DEATHS] },
+    growth(30, [5, 8], [320, 440], [50, 80]),
+    { label: '전투', points: 35, metrics: [FRONTLINE(400, 880)] },
+    { label: '생존', points: 25, metrics: [DEATHS_TOP] },
   ],
   JUNGLE: [
     { label: '오브젝트', points: 20, metrics: [m('objectiveShare', 20, 60)] },
@@ -145,9 +148,9 @@ export const LANE_RULES = {
     { label: '생존', points: 30, metrics: [DEATHS] },
   ],
   SUPPORT: [
-    { label: '시야', points: 35, metrics: [m('visionPerMinute', 1.5, 3.3, .7), m('controlWards', 2, 10, .3)] },
+    { label: '시야', points: 35, metrics: [m('visionPerMinute', 1.5, 3.3, .7), m('controlWards', 2, 12, .3)] },
     { label: '팀 기여', points: 30, metrics: [m('killParticipation', 35, 70)] },
-    { label: '생존', points: 25, metrics: [DEATHS] },
+    { label: '생존', points: 25, metrics: [DEATHS_SUPPORT] },
   ],
 }
 
