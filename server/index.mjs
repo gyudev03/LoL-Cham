@@ -14,7 +14,6 @@ const ASIA = 'https://asia.api.riotgames.com'
 const DDRAGON = 'https://ddragon.leagueoflegends.com'
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), 'data')
 const CACHE_PATH = path.join(DATA_DIR, 'riot-season-cache.json')
-const USERS_PATH = path.join(DATA_DIR, 'users.json')
 const META_PATH = path.join(DATA_DIR, 'meta.json')
 const DIST_DIR = path.join(process.cwd(), 'dist')
 const APP_USERNAME = process.env.APP_USERNAME || 'chamlog'
@@ -28,8 +27,13 @@ const syncJobs = new Map()
 app.use(cors({ origin: 'http://localhost:5173' }))
 app.get('/api/health', (_request, response) => response.json({ configured: Boolean(API_KEY) }))
 
-if (process.env.NODE_ENV === 'production' && !APP_PASSWORD) {
-  throw new Error('APP_PASSWORD must be set in production.')
+// 기본은 이 PC(127.0.0.1)에서만 접속할 수 있다. 배포 환경(production, Render)이거나 HOST를 직접 지정했을 때만 외부에 연다.
+// 외부에 열 때는 APP_PASSWORD가 없으면 서버를 시작하지 않는다(동기화·삭제 API를 아무나 호출하지 못하게).
+const IS_DEPLOYED = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER)
+const HOST = process.env.HOST || (IS_DEPLOYED ? '0.0.0.0' : '127.0.0.1')
+const IS_LOOPBACK_ONLY = ['127.0.0.1', 'localhost', '::1'].includes(HOST)
+if (!IS_LOOPBACK_ONLY && !APP_PASSWORD) {
+  throw new Error(`HOST=${HOST} 처럼 외부에 서버를 열려면 APP_PASSWORD를 설정해야 합니다.`)
 }
 
 function sameSecret(left, right) {
@@ -55,6 +59,10 @@ function requireAppAccess(request, response, next) {
 app.use(requireAppAccess)
 app.use(express.json())
 
+// 비동기 라우트에서 오류가 나도 서버가 멈추지 않고 JSON 오류로 응답하게 한다.
+const safe = (handler) => (request, response, next) => Promise.resolve(handler(request, response, next))
+  .catch((error) => response.status(500).json({ message: error.message || '서버 오류가 발생했습니다.' }))
+
 class RiotApiError extends Error {
   constructor(status, message) { super(message); this.status = status }
 }
@@ -72,36 +80,48 @@ async function riotFetch(url) {
   return response.json()
 }
 
-async function loadCache() {
-  try { return JSON.parse(await readFile(CACHE_PATH, 'utf8')) } catch { return { players: {} } }
+// 캐시 파일 접근(읽기·쓰기)을 한 줄로 세운다. 읽는 도중에 파일을 교체하다가 Windows에서 EPERM/EBUSY가 나는 것을 막는다.
+function withCacheLock(task) {
+  const run = cacheWriteChain.then(task)
+  cacheWriteChain = run.catch(() => {})
+  return run
+}
+
+const RETRYABLE_FILE_ERRORS = new Set(['EPERM', 'EBUSY', 'EACCES'])
+// Windows에서는 백신·검색 색인·동기화 프로그램이 파일을 잠깐 잡고 있으면 교체나 읽기가 거부될 수 있어 잠시 뒤 다시 시도한다.
+async function retryFileOperation(operation) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation()
+    } catch (error) {
+      if (!RETRYABLE_FILE_ERRORS.has(error.code) || attempt >= 8) throw error
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+    }
+  }
+}
+
+function loadCache() {
+  return withCacheLock(async () => {
+    try {
+      return JSON.parse(await retryFileOperation(() => readFile(CACHE_PATH, 'utf8')))
+    } catch (error) {
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) return { players: {} }
+      throw error
+    }
+  })
 }
 
 async function loadMeta() {
   try { return JSON.parse(await readFile(META_PATH, 'utf8')) } catch { return null }
 }
 
-async function loadUsers() {
-  try { return JSON.parse(await readFile(USERS_PATH, 'utf8')) } catch { return null }
-}
-
 function saveCache(cache) {
-  cacheWriteChain = cacheWriteChain.then(async () => {
+  return withCacheLock(async () => {
     await mkdir(DATA_DIR, { recursive: true })
     const temporaryPath = `${CACHE_PATH}.tmp`
     await writeFile(temporaryPath, JSON.stringify(cache), 'utf8')
-    await rename(temporaryPath, CACHE_PATH)
+    await retryFileOperation(() => rename(temporaryPath, CACHE_PATH))
   })
-  return cacheWriteChain
-}
-
-function saveUsers(users) {
-  cacheWriteChain = cacheWriteChain.then(async () => {
-    await mkdir(DATA_DIR, { recursive: true })
-    const temporaryPath = `${USERS_PATH}.tmp`
-    await writeFile(temporaryPath, JSON.stringify(users, null, 2), 'utf8')
-    await rename(temporaryPath, USERS_PATH)
-  })
-  return cacheWriteChain
 }
 
 function createJob() {
@@ -229,6 +249,7 @@ function buildChampionStats(matches, masteries, catalog, meta = null) {
       tier: metaEntry?.tier ?? '—', mastery: mastery?.championPoints || 0, masteryLevel: mastery?.championLevel || 0,
       aiScore: evaluation.aiScore, rawScore: evaluation.rawScore, referenceScore: evaluation.referenceScore, winRate, games: count, lastPlayed: lastPlayedLabel(games[0].createdAt),
       analysisNote: evaluation.analysisNote, scoreNote: evaluation.scoreNote,
+      recent: games.slice(0, 10).map((game) => ({ win: Boolean(game.participant.win), kills: game.participant.kills ?? 0, deaths: game.participant.deaths ?? 0, assists: game.participant.assists ?? 0 })),
       runeInfo: mostPlayedRunes(games, catalog.runeById),
       counters: { good: goodCounters.length ? goodCounters : emptyCounter, difficult: difficultCounters.length ? difficultCounters : emptyCounter },
       strengths: evaluation.strengths, improvements: evaluation.improvements,
@@ -240,20 +261,6 @@ function buildChampionStats(matches, masteries, catalog, meta = null) {
   const fits = computeFit(results.map((item) => ({ key: item.entryId, lane: item.lane, count: item.games, rawScore: item.rawScore })))
   return results.map((item) => ({ ...item, fit: fits.get(item.entryId) ?? null }))
 }
-
-app.get('/api/users', async (_request, response) => {
-  response.json({ users: await loadUsers() })
-})
-
-app.put('/api/users', async (request, response) => {
-  const users = request.body?.users
-  if (!Array.isArray(users) || users.length > 50) return response.status(400).json({ message: '사용자 목록 형식이 올바르지 않습니다.' })
-  const lanes = new Set(['TOP', 'JUNGLE', 'MID', 'BOTTOM', 'SUPPORT'])
-  const valid = users.every((user) => Number.isFinite(user.id) && typeof user.name === 'string' && user.name.trim() && typeof user.riotId === 'string' && user.riotId.trim() && typeof user.tag === 'string' && user.tag.trim() && lanes.has(user.lane) && typeof user.active === 'boolean')
-  if (!valid) return response.status(400).json({ message: '사용자 정보에 필수 항목이 누락되었습니다.' })
-  await saveUsers(users)
-  response.json({ users })
-})
 
 async function collectSeasonMatchIds(puuid, startTime, job) {
   const ids = new Set()
@@ -280,6 +287,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     const cache = await loadCache()
     const cachedPlayer = cache.players[account.puuid]
     const player = cachedPlayer?.seasonStart === startTime ? cachedPlayer : { seasonStart: startTime, matches: {} }
+    player.account = { gameName: account.gameName, tagLine: account.tagLine }
     cache.players[account.puuid] = player
 
     const [masteries, leagueEntries, catalog, matchIds] = await Promise.all([
@@ -314,6 +322,7 @@ async function runSeasonSync(job, gameName, tagLine) {
     job.result = {
       account: { puuid: account.puuid, gameName: account.gameName, tagLine: account.tagLine, rank: ranked ? `${ranked.tier} ${ranked.rank} ${ranked.leaguePoints}LP` : '랭크 정보 없음' },
       champions: championStats,
+      totals: { games: matches.length, wins: matches.filter((match) => match.info.participants.find((participant) => participant.puuid === account.puuid)?.win).length },
       syncedAt: new Date().toISOString(),
       matchCount: matches.length,
       seasonStart: new Date(startTime * 1000).toISOString(),
@@ -351,12 +360,48 @@ app.get('/api/riot/sync/:jobId', (request, response) => {
   response.json(jobResponse(job))
 })
 
-app.get('/api/riot/summary/:puuid', async (request, response) => {
+app.get('/api/riot/summary/:puuid', safe(async (request, response) => {
   const cache = await loadCache()
   const summary = cache.players?.[request.params.puuid]?.summary
   if (!summary) return response.status(404).json({ message: '저장된 분석 결과가 없습니다. 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' })
   response.json(summary)
-})
+}))
+
+// 이 PC 서버에 저장된 데이터 목록: 사용자 이름(Riot ID)과 저장 현황을 확인한다.
+function playerIdentity(puuid, player) {
+  const account = player.summary?.account || player.account
+  if (account?.gameName) return { gameName: account.gameName, tagLine: account.tagLine || '' }
+  // 요약이 없는 예전 캐시는 저장된 경기 기록에서 이름을 찾는다.
+  for (const match of Object.values(player.matches || {})) {
+    const participant = match?.info?.participants?.find((item) => item.puuid === puuid)
+    if (participant?.riotIdGameName) return { gameName: participant.riotIdGameName, tagLine: participant.riotIdTagline || '' }
+  }
+  return { gameName: '', tagLine: '' }
+}
+
+app.get('/api/riot/cache', safe(async (_request, response) => {
+  const cache = await loadCache()
+  const players = Object.entries(cache.players || {}).map(([puuid, player]) => ({
+    puuid,
+    ...playerIdentity(puuid, player),
+    matchCount: Object.keys(player.matches || {}).length,
+    hasSummary: Boolean(player.summary),
+    championCount: player.summary?.champions?.length ?? 0,
+    syncedAt: player.summary?.syncedAt ?? null,
+  }))
+  response.json({ players })
+}))
+
+app.delete('/api/riot/cache/:puuid', safe(async (request, response) => {
+  if ([...syncJobs.values()].some((job) => job.status === 'queued' || job.status === 'running')) {
+    return response.status(409).json({ message: '동기화가 진행 중입니다. 끝나거나 취소된 뒤 다시 삭제하세요.' })
+  }
+  const cache = await loadCache()
+  if (!cache.players?.[request.params.puuid]) return response.status(404).json({ message: '삭제할 저장 데이터를 찾지 못했습니다.' })
+  delete cache.players[request.params.puuid]
+  await saveCache(cache)
+  response.json({ ok: true })
+}))
 
 app.delete('/api/riot/sync/:jobId', (request, response) => {
   const job = syncJobs.get(request.params.jobId)
@@ -374,4 +419,4 @@ app.use((request, response) => {
   return response.sendFile(path.join(DIST_DIR, 'index.html'))
 })
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Chamlog server listening on port ${PORT}`))
+app.listen(PORT, HOST, () => console.log(`Chamlog server listening on ${HOST}:${PORT}${IS_LOOPBACK_ONLY ? ' (이 PC에서만 접속 가능)' : ''}`))
