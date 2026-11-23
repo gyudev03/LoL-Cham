@@ -103,3 +103,11 @@ select option:checked { background: #26364f; color: #fff; }
 .bulk-failures { align-items: flex-start; }
 .bulk-failures p { margin: 0 0 3px; }
 
+
+/* 한 사용자에 여러 아이디 */
+.account-fields { grid-column: 1 / -1; display: grid; gap: 8px; }
+.account-field { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.account-fields .add-account { justify-self: start; }
+.form-hint { margin: 0; color: #8190a5; font-size: 11px; line-height: 1.5; }
+.user-row .extra-count { color: #7fd8b3; margin-left: 4px; }
+.account-select-wrap select { min-width: 210px; }

@@ -5,6 +5,7 @@ import { timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { evaluateChampion, computeFit } from './scoring.mjs'
+import { AGGREGATE_PUUID, bestRank, countWins, mergeMasteries, ownedMatchesOf } from './aggregate.mjs'
 
 const app = express()
 const PORT = Number(process.env.PORT || 8787)
@@ -365,6 +366,35 @@ app.get('/api/riot/summary/:puuid', safe(async (request, response) => {
   const summary = cache.players?.[request.params.puuid]?.summary
   if (!summary) return response.status(404).json({ message: '저장된 분석 결과가 없습니다. 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' })
   response.json(summary)
+}))
+
+// '모든 아이디 통합': 한 사용자의 여러 계정에 저장된 경기를 합쳐 챔피언 통계를 다시 계산한다.
+// 점수는 경기 원본으로 다시 계산해야 하므로 계정별 점수를 평균내지 않는다. 동기화를 마친 계정만 포함한다.
+app.post('/api/riot/aggregate', safe(async (request, response) => {
+  const puuids = [...new Set((Array.isArray(request.body?.puuids) ? request.body.puuids : []).map(String).filter(Boolean))]
+  const name = String(request.body?.name || '').trim()
+  if (!puuids.length) return response.status(400).json({ message: '통합할 계정이 없습니다.' })
+  const cache = await loadCache()
+  const included = puuids.filter((puuid) => cache.players?.[puuid]?.summary)
+  if (!included.length) return response.status(404).json({ message: '동기화를 마친 계정이 없어 통합할 수 없습니다. 먼저 데이터 새로고침을 진행하세요.' })
+
+  const catalog = await getChampionCatalog()
+  const idToKey = new Map([...catalog.byKey].map(([key, item]) => [item.id, key]))
+  const summaries = included.map((puuid) => cache.players[puuid].summary)
+  const perAccount = included.map((puuid) => ({ puuid, matches: ownedMatchesOf(cache.players[puuid], puuid) }))
+  const matches = perAccount.flatMap((item) => item.matches).sort((a, b) => b.info.gameCreation - a.info.gameCreation)
+  const champions = buildChampionStats(matches, mergeMasteries(summaries, idToKey), catalog, await loadMeta())
+  const syncedTimes = summaries.map((summary) => Date.parse(summary.syncedAt)).filter(Number.isFinite)
+  response.json({
+    aggregate: true,
+    account: { puuid: AGGREGATE_PUUID, gameName: name || '통합', tagLine: '통합', rank: bestRank(summaries.map((summary) => summary.account?.rank)) },
+    accounts: perAccount.map((item) => ({ puuid: item.puuid, gameName: cache.players[item.puuid].summary.account?.gameName ?? '', tagLine: cache.players[item.puuid].summary.account?.tagLine ?? '', matches: item.matches.length })),
+    champions,
+    totals: { games: matches.length, wins: countWins(matches) },
+    // 가장 오래된 계정 기준으로 '마지막 동기화'를 보여준다.
+    syncedAt: new Date(syncedTimes.length ? Math.min(...syncedTimes) : Date.now()).toISOString(),
+    matchCount: matches.length,
+  })
 }))
 
 // 이 PC 서버에 저장된 데이터 목록: 사용자 이름(Riot ID)과 저장 현황을 확인한다.

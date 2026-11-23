@@ -3,9 +3,10 @@ import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebas
 import { collection, deleteDoc, doc, getDoc, getDocs, setDoc } from 'firebase/firestore'
 import {
   Check, ChevronDown, ChevronUp, CircleAlert, Flame, Gauge, Plus, RefreshCw,
-  Pencil, Search, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload, Trash2, Database, TrendingUp,
+  Pencil, Search, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload, Trash2, Database, TrendingUp, Layers,
 } from 'lucide-react'
 import { auth, db, googleProvider } from './firebase'
+import { accountText, accountsOf, defaultSelection, normalizeRiotId, oldestSync, rebuildAccounts, resolveSelection, stripUndefined, withAccount, type AccountRef, type AccountSel, type RiotAccount } from './accounts'
 
 type Lane = 'TOP' | 'JUNGLE' | 'MID' | 'BOTTOM' | 'SUPPORT'
 
@@ -15,6 +16,8 @@ type Profile = {
   riotId: string
   tag: string
   puuid?: string
+  // 대표 아이디(riotId/tag/puuid) 외에 이 사용자가 가진 다른 Riot 아이디. 없으면 아이디가 하나뿐인 사용자.
+  extraAccounts?: RiotAccount[]
   lane: Lane
   active: boolean
   order?: number
@@ -71,6 +74,9 @@ type SyncResult = {
   account: { puuid: string; gameName: string; tagLine: string; rank?: string }
   totals?: SeasonTotals
   syncedAt: string
+  // '모든 아이디 통합' 결과일 때만 있다. accounts는 통합에 포함된 아이디 목록.
+  aggregate?: boolean
+  accounts?: { puuid: string; gameName: string; tagLine: string; matches: number }[]
 }
 
 const tierNames: Record<string, string> = {
@@ -88,6 +94,9 @@ function formatRank(rank?: string) {
 const sharedProfiles = collection(db, 'shared', 'chamlog', 'profiles')
 const summariesCol = collection(db, 'shared', 'chamlog', 'summaries')
 const summaryRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', String(profileId))
+// '모든 아이디 통합' 결과는 기존 summaries 컬렉션에 agg-사용자ID 로 저장한다(Firestore 규칙을 따로 바꿀 필요가 없다).
+const AGGREGATE_PUUID = 'aggregate'
+const aggregateRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', `agg-${profileId}`)
 const syncApiBase = import.meta.env.VITE_SYNC_API_URL || '/api'
 const hasSyncServer = window.location.hostname === 'localhost' || Boolean(import.meta.env.VITE_SYNC_API_URL)
 
@@ -141,9 +150,8 @@ function aiGrade(score: number | null) {
 // 저장된 분석 데이터는 사용자 ID가 아니라 Riot 계정(puuid, 없으면 Riot ID#태그)으로 사용자와 연결한다.
 // 그래서 사용자를 삭제했다가 같은 Riot ID로 다시 추가해도 기존 분석 데이터를 그대로 쓸 수 있다.
 type AccountLike = { puuid?: string; gameName?: string; tagLine?: string }
-const normalizeRiotId = (value?: string) => (value ?? '').normalize('NFC').replace(/\s+/g, '').toLowerCase()
 function accountMatchesProfile(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>, account?: AccountLike | null) {
-  if (!account) return false
+  if (!account || account.puuid === AGGREGATE_PUUID) return false
   if (target.puuid && account.puuid) return target.puuid === account.puuid
   const name = normalizeRiotId(account.gameName)
   return Boolean(name) && name === normalizeRiotId(target.riotId) && normalizeRiotId(account.tagLine) === normalizeRiotId(target.tag)
@@ -155,7 +163,7 @@ async function resolveSummaryRef(target: Pick<Profile, 'id' | 'puuid' | 'riotId'
   const matched = snapshot.docs.find((item) => accountMatchesProfile(target, (item.data() as SyncResult).account))
   return matched ? matched.ref : direct
 }
-async function findLocalPuuid(target: Profile) {
+async function findLocalPuuid(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>) {
   try {
     const response = await fetch(`${syncApiBase}/riot/cache`)
     if (!response.ok) return undefined
@@ -166,12 +174,70 @@ async function findLocalPuuid(target: Profile) {
   }
 }
 
+// 한 아이디(대표 또는 추가)의 분석 결과를 저장할 문서. 대표 아이디는 예전 방식(사용자 ID) 문서도 인정하고, 추가 아이디는 계정으로만 찾는다.
+async function resolveAccountSummaryRef(profile: Profile, account: AccountRef) {
+  if (account.index === 0) return resolveSummaryRef({ id: profile.id, puuid: account.puuid, riotId: account.riotId, tag: account.tag })
+  const snapshot = await getDocs(summariesCol)
+  const matched = snapshot.docs.find((item) => accountMatchesProfile(account, (item.data() as SyncResult).account))
+  return matched ? matched.ref : doc(summariesCol, `acct-${(account.puuid ?? `${normalizeRiotId(account.riotId)}-${normalizeRiotId(account.tag)}`).replace(/\//g, '_')}`)
+}
+
+// 한 아이디의 저장된 분석 결과를 찾는다: 공용 Firebase → (이 PC 서버가 있으면) 서버 저장 데이터 순서.
+async function fetchAccountSummary(profile: Profile, account: AccountRef): Promise<{ payload: SyncResult | null; localOnly: boolean }> {
+  let payload: SyncResult | null = null
+  if (account.index === 0) {
+    const direct = await getDoc(summaryRef(profile.id))
+    if (direct.exists()) payload = direct.data() as SyncResult
+  }
+  if (!payload) {
+    const snapshot = await getDocs(summariesCol)
+    const matched = snapshot.docs.find((item) => accountMatchesProfile(account, (item.data() as SyncResult).account))
+    if (matched) payload = matched.data() as SyncResult
+  }
+  if (payload) return { payload, localOnly: false }
+  const localPuuid = account.puuid || await findLocalPuuid(account)
+  if (!localPuuid) return { payload: null, localOnly: false }
+  const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(localPuuid)}`)
+  if (response.ok) return { payload: await response.json() as SyncResult, localOnly: true }
+  if (response.status !== 404) throw new Error((await response.json().catch(() => ({}))).message || '저장된 분석 데이터를 불러오지 못했습니다.')
+  return { payload: null, localOnly: false }
+}
+
+// 이 PC 서버에 저장된 경기로 '모든 아이디 통합' 통계를 계산한다. 서버가 없거나 동기화된 아이디가 없으면 null.
+async function buildAggregate(profile: Profile): Promise<SyncResult | null> {
+  if (!hasSyncServer) return null
+  const puuids: string[] = []
+  for (const account of accountsOf(profile)) {
+    const puuid = account.puuid || await findLocalPuuid(account)
+    if (puuid) puuids.push(puuid)
+  }
+  if (!puuids.length) return null
+  try {
+    const response = await fetch(`${syncApiBase}/riot/aggregate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ puuids, name: profile.name }) })
+    return response.ok ? await response.json() as SyncResult : null
+  } catch {
+    return null
+  }
+}
+
+async function fetchAggregate(profile: Profile): Promise<{ payload: SyncResult | null; localOnly: boolean }> {
+  const stored = await getDoc(aggregateRef(profile.id))
+  if (stored.exists()) return { payload: stored.data() as SyncResult, localOnly: false }
+  const built = await buildAggregate(profile)
+  return { payload: built, localOnly: Boolean(built) }
+}
+
 function profileFromStorage(item: Omit<Profile, 'syncedAt'> & { syncedAt?: string | Date }) {
   return { ...item, syncedAt: item.syncedAt ? new Date(item.syncedAt) : new Date(0) }
 }
 
 function profileForStorage(item: Profile) {
-  return { ...item, syncedAt: item.syncedAt.toISOString() }
+  const { extraAccounts, ...rest } = item
+  return stripUndefined({
+    ...rest,
+    syncedAt: item.syncedAt.toISOString(),
+    ...(extraAccounts?.length ? { extraAccounts: extraAccounts.map((account) => stripUndefined({ ...account })) } : {}),
+  })
 }
 
 function sortProfiles(list: Profile[]) {
@@ -188,7 +254,10 @@ export default function App() {
   const [isUserModalOpen, setUserModalOpen] = useState(false)
   const [isDataModalOpen, setDataModalOpen] = useState(false)
   const [bulk, setBulk] = useState<BulkSync>({ running: false, message: '', done: 0, total: 0, failures: [] })
-  const [summaryMeta, setSummaryMeta] = useState<{ rank?: string; totals?: SeasonTotals } | null>(null)
+  const [summaryMeta, setSummaryMeta] = useState<{ rank?: string; totals?: SeasonTotals; accounts?: SyncResult['accounts'] } | null>(null)
+  // 선택한 아이디: 'all'은 모든 아이디 통합, 숫자는 accountsOf(사용자)의 위치(0이 대표 아이디)
+  const [accountSel, setAccountSel] = useState<AccountSel>(0)
+  const accountSelRef = useRef<AccountSel>(0)
   const [isSyncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
   const [syncProgress, setSyncProgress] = useState('')
@@ -204,6 +273,14 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false)
   const [query, setQuery] = useState('')
   const profile = profiles.find((item) => item.id === profileId)
+  const accounts = profile ? accountsOf(profile) : []
+  const effectiveSel: AccountSel = resolveSelection(accountSel, accounts.length)
+  const selectedAccount = accounts[effectiveSel === 'all' ? 0 : effectiveSel]
+  const displayedSyncedAt = effectiveSel === 'all' ? oldestSync(accounts) : (selectedAccount?.syncedAt ?? new Date(0))
+  // '모든 아이디 통합'을 보고 있을 때, 어떤 아이디가 포함됐는지 알려준다. (동기화하지 않은 아이디는 제외된다)
+  const aggregateNote = effectiveSel === 'all' && summaryMeta?.accounts
+    ? ` 통합 대상: ${summaryMeta.accounts.map((item) => `${item.gameName}#${item.tagLine}`).join(', ')}${summaryMeta.accounts.length < accounts.length ? ` (동기화되지 않은 ${accounts.length - summaryMeta.accounts.length}개 아이디는 제외)` : ''}.`
+    : ''
   // 오래 걸리는 비동기 작업이 최신 상태를 읽을 수 있도록 ref에 복사해 둔다.
   const profilesRef = useRef(profiles)
   const profileIdRef = useRef(profileId)
@@ -266,49 +343,35 @@ export default function App() {
     if (first) setSelectedId(championEntryId(first))
   }
 
-  async function loadCachedData(targetProfile: Profile) {
+  // 선택한 아이디(또는 '모든 아이디 통합')의 저장된 분석 결과를 불러온다. 아이디가 둘 이상이면 처음에는 통합을 보여준다.
+  async function loadCachedData(targetProfile: Profile, requested: AccountSel = defaultSelection(targetProfile)) {
     // 사용자를 빠르게 바꿀 때 늦게 도착한 이전 응답이 화면을 덮어쓰지 않도록 요청 번호를 확인한다.
     const seq = ++loadSeq.current
+    const accountList = accountsOf(targetProfile)
+    const sel = resolveSelection(requested, accountList.length)
+    accountSelRef.current = sel
+    setAccountSel(sel)
     setSyncError('')
     setChampionData([])
     setSelectedId('')
     setLiveData(false)
     setSummaryMeta(null)
     try {
-      let payload: SyncResult | null = null
-      let localOnly = false
-      const directSummary = await getDoc(summaryRef(targetProfile.id))
-      if (directSummary.exists()) {
-        payload = directSummary.data() as SyncResult
-      } else {
-        // 사용자 ID로 저장된 데이터가 없으면 같은 Riot 계정으로 저장된 데이터를 찾는다.
-        const snapshot = await getDocs(summariesCol)
-        const matched = snapshot.docs.find((item) => accountMatchesProfile(targetProfile, (item.data() as SyncResult).account))
-        if (matched) payload = matched.data() as SyncResult
-      }
-      if (!payload) {
-        const puuid = targetProfile.puuid || (hasSyncServer ? await findLocalPuuid(targetProfile) : undefined)
-        if (puuid) {
-          const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(puuid)}`)
-          if (response.ok) {
-            payload = await response.json() as SyncResult
-            localOnly = true
-          } else if (response.status !== 404) {
-            const body = await response.json().catch(() => ({}))
-            throw new Error(body.message || '저장된 분석 데이터를 불러오지 못했습니다.')
-          }
-        }
-      }
+      const account = accountList[sel === 'all' ? 0 : sel]
+      const { payload, localOnly } = sel === 'all' ? await fetchAggregate(targetProfile) : await fetchAccountSummary(targetProfile, account)
       if (seq !== loadSeq.current) return
       setSharedData(Boolean(payload) && !localOnly)
       setLocalOnlyData(localOnly)
       if (!payload?.champions?.length) return
       const loaded = payload
-      setSummaryMeta({ rank: loaded.account?.rank, totals: loaded.totals })
-      if (loaded.account?.puuid && !targetProfile.puuid && accountMatchesProfile(targetProfile, loaded.account)) {
-        setProfiles((current) => current.map((item) => item.id === targetProfile.id && !item.puuid
-          ? { ...item, puuid: loaded.account.puuid, syncedAt: loaded.syncedAt ? new Date(loaded.syncedAt) : item.syncedAt }
-          : item))
+      setSummaryMeta({ rank: loaded.account?.rank, totals: loaded.totals, accounts: loaded.aggregate ? loaded.accounts : undefined })
+      // 저장된 데이터로 puuid를 알게 되면 해당 아이디에 기록해 둔다. (대표·추가 아이디 모두)
+      if (sel !== 'all' && loaded.account?.puuid && !account.puuid && accountMatchesProfile(account, loaded.account)) {
+        setProfiles((current) => current.map((item) => {
+          const target = item.id === targetProfile.id ? accountsOf(item)[account.index] : undefined
+          if (!target || target.puuid) return item
+          return withAccount(item, account.index, { riotId: target.riotId, tag: target.tag, puuid: loaded.account.puuid, syncedAt: loaded.syncedAt ? new Date(loaded.syncedAt) : target.syncedAt })
+        }))
       }
       setChampionData(loaded.champions)
       setLiveData(true)
@@ -321,7 +384,7 @@ export default function App() {
   }
 
   // Riot 동기화 작업 하나를 시작하고 끝날 때까지 기다린다. (단일·전체 동기화 공용)
-  async function runSyncJob(target: Profile, onJob: (id: string) => void, onProgress: (message: string, timing: string) => void): Promise<SyncResult> {
+  async function runSyncJob(target: Pick<Profile, 'riotId' | 'tag'>, onJob: (id: string) => void, onProgress: (message: string, timing: string) => void): Promise<SyncResult> {
     const response = await fetch(`${syncApiBase}/riot/sync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ gameName: target.riotId, tagLine: target.tag }),
@@ -334,16 +397,26 @@ export default function App() {
     return result
   }
 
-  // 동기화 결과를 사용자 정보와 공용 분석 데이터로 저장하고, 갱신된 사용자 목록을 돌려준다.
-  async function saveSyncResult(target: Profile, result: SyncResult, base: Profile[]) {
-    const nextProfiles = base.map((item) => item.id === target.id ? { ...item, riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) } : item)
+  // 동기화 결과를 사용자 정보와 공용 분석 데이터로 저장하고, 갱신된 사용자 목록을 돌려준다. accountIndex 0이 대표 아이디.
+  async function saveSyncResult(target: Profile, accountIndex: number, result: SyncResult, base: Profile[]) {
+    const nextProfiles = base.map((item) => item.id === target.id
+      ? withAccount(item, accountIndex, { riotId: result.account.gameName, tag: result.account.tagLine, puuid: result.account.puuid, syncedAt: new Date(result.syncedAt) })
+      : item)
     const updated = nextProfiles.find((item) => item.id === target.id) ?? target
     setProfiles(nextProfiles)
     await persistProfiles(nextProfiles)
-    await setDoc(await resolveSummaryRef(updated), result)
+    await setDoc(await resolveAccountSummaryRef(updated, accountsOf(updated)[accountIndex]), result)
     setSharedData(true)
     setLocalOnlyData(false)
     return nextProfiles
+  }
+
+  // 아이디가 둘 이상인 사용자는 '모든 아이디 통합' 통계를 다시 계산해 공용 데이터로 저장한다.
+  async function refreshAggregate(owner: Profile) {
+    if (accountsOf(owner).length < 2) return null
+    const result = await buildAggregate(owner)
+    if (result) await setDoc(aggregateRef(owner.id), result)
+    return result
   }
 
   async function refreshData(targetProfile = profile) {
@@ -357,24 +430,58 @@ export default function App() {
       return
     }
     if (bulk.running) return
+    // 통합을 보고 있으면 사용자의 모든 아이디를, 아이디 하나를 보고 있으면 그 아이디만 동기화한다.
+    const sel = accountSelRef.current
+    const indices = sel === 'all' ? accountsOf(targetProfile).map((item) => item.index) : [sel]
     setSyncing(true)
     setSyncError('')
     setSyncNotice('')
     setSyncProgress('동기화 작업을 시작하는 중')
     setSyncTiming('')
     try {
-      const result = await runSyncJob(targetProfile, setSyncJobId, (message, timing) => { setSyncProgress(message); setSyncTiming(timing) })
-      setChampionData(result.champions)
-      setLiveData(true)
-      setSummaryMeta({ rank: result.account.rank, totals: result.totals })
-      const preferred = topChampion(result.champions, lane) as Champion
-      setLane(preferred.lane)
-      setSelectedId(championEntryId(preferred))
-      try {
-        await saveSyncResult(targetProfile, result, profilesRef.current)
-      } catch (error) {
-        setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.')
+      let base = profilesRef.current
+      const failures: string[] = []
+      for (const [position, index] of indices.entries()) {
+        const owner = base.find((item) => item.id === targetProfile.id) ?? targetProfile
+        const account = accountsOf(owner)[index]
+        const prefix = indices.length > 1 ? `${accountText(account)} (${position + 1}/${indices.length}) · ` : ''
+        try {
+          const result = await runSyncJob(account, setSyncJobId, (message, timing) => { setSyncProgress(`${prefix}${message}`); setSyncTiming(timing) })
+          if (sel !== 'all') {
+            setChampionData(result.champions)
+            setLiveData(true)
+            setSummaryMeta({ rank: result.account.rank, totals: result.totals })
+            const preferred = topChampion(result.champions, lane) as Champion
+            setLane(preferred.lane)
+            setSelectedId(championEntryId(preferred))
+          }
+          try {
+            base = await saveSyncResult(targetProfile, index, result, base)
+          } catch (error) {
+            setProfileError(error instanceof Error ? error.message : '공유 데이터를 저장하지 못했습니다.')
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.'
+          // 아이디 하나만 동기화하거나 취소한 경우는 그대로 알린다. 통합 중 한 아이디의 실패는 나머지를 계속 진행한다.
+          if (indices.length === 1 || message === '동기화가 취소되었습니다.') throw error
+          failures.push(`${accountText(account)}: ${message}`)
+        }
       }
+      const owner = base.find((item) => item.id === targetProfile.id) ?? targetProfile
+      const notes: string[] = []
+      if (accountsOf(owner).length > 1) {
+        setSyncProgress('모든 아이디 통합 통계를 계산하는 중')
+        let aggregate: SyncResult | null = null
+        try {
+          aggregate = await refreshAggregate(owner)
+        } catch (error) {
+          setProfileError(error instanceof Error ? error.message : '통합 데이터를 저장하지 못했습니다.')
+        }
+        if (sel === 'all') await loadCachedData(owner, 'all')
+        if (!aggregate) notes.push('통합 통계를 계산하지 못했습니다. 동기화가 끝난 아이디가 있는지 확인하세요.')
+      }
+      if (failures.length) notes.unshift(`일부 아이디를 동기화하지 못했습니다. ${failures.join(' · ')}`)
+      if (notes.length) setSyncError(notes.join(' '))
     } catch (error) {
       const message = error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.'
       if (message === '동기화가 취소되었습니다.') setSyncNotice('동기화를 취소했습니다. 수집된 게임은 다음 동기화 때 재사용됩니다.')
@@ -393,39 +500,55 @@ export default function App() {
     await fetch(`${syncApiBase}/riot/sync/${syncJobId}`, { method: 'DELETE' })
   }
 
-  // 활성 사용자를 한 명씩 차례로 동기화한다. (Riot 요청 한도 때문에 동시에 하지 않는다)
+  // 활성 사용자의 모든 아이디를 하나씩 차례로 동기화한다. (Riot 요청 한도 때문에 동시에 하지 않는다)
   async function syncAllProfiles() {
     if (!isAdmin || !hasSyncServer || isSyncing || bulk.running) return
     const targets = profilesRef.current.filter((item) => item.active)
-    if (!targets.length) return
+    const total = targets.reduce((sum, item) => sum + accountsOf(item).length, 0)
+    if (!total) return
     bulkCancelled.current = false
     setSyncError('')
     setSyncNotice('')
-    setBulk({ running: true, message: '시작하는 중', done: 0, total: targets.length, failures: [] })
+    setBulk({ running: true, message: '시작하는 중', done: 0, total, failures: [] })
     const failures: string[] = []
     let base = profilesRef.current
     let completed = 0
-    for (const [index, target] of targets.entries()) {
-      if (bulkCancelled.current) break
-      const label = `${target.name} (${index + 1}/${targets.length})`
-      setBulk((current) => ({ ...current, message: `${label} 동기화 중` }))
-      try {
-        const result = await runSyncJob(target, (id) => { bulkJobId.current = id }, (message) => setBulk((current) => ({ ...current, message: `${label} · ${message}` })))
-        base = await saveSyncResult(target, result, base)
-        completed += 1
-        setBulk((current) => ({ ...current, done: completed }))
-      } catch (error) {
-        const message = error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.'
-        if (message === '동기화가 취소되었습니다.') break
-        failures.push(`${target.name}: ${message}`)
-      } finally {
-        bulkJobId.current = null
+    let position = 0
+    outer: for (const target of targets) {
+      const accountCount = accountsOf(target).length
+      for (let index = 0; index < accountCount; index += 1) {
+        if (bulkCancelled.current) break outer
+        position += 1
+        const account = accountsOf(base.find((item) => item.id === target.id) ?? target)[index]
+        const who = accountCount > 1 ? `${target.name} · ${accountText(account)}` : target.name
+        const label = `${who} (${position}/${total})`
+        setBulk((current) => ({ ...current, message: `${label} 동기화 중` }))
+        try {
+          const result = await runSyncJob(account, (id) => { bulkJobId.current = id }, (message) => setBulk((current) => ({ ...current, message: `${label} · ${message}` })))
+          base = await saveSyncResult(target, index, result, base)
+          completed += 1
+          setBulk((current) => ({ ...current, done: completed }))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : '동기화 중 오류가 발생했습니다.'
+          if (message === '동기화가 취소되었습니다.') break outer
+          failures.push(`${who}: ${message}`)
+        } finally {
+          bulkJobId.current = null
+        }
+      }
+      // 아이디가 둘 이상인 사용자는 통합 통계도 갱신한다.
+      if (accountCount > 1) {
+        try {
+          await refreshAggregate(base.find((item) => item.id === target.id) ?? target)
+        } catch (error) {
+          failures.push(`${target.name} 통합: ${error instanceof Error ? error.message : '통합 데이터를 저장하지 못했습니다.'}`)
+        }
       }
     }
-    setBulk({ running: false, message: '', done: completed, total: targets.length, failures })
-    setSyncNotice(`전체 동기화: ${completed}/${targets.length}명 완료${bulkCancelled.current ? ' (중간에 취소됨)' : ''}${failures.length ? `, 실패 ${failures.length}명` : ''}`)
+    setBulk({ running: false, message: '', done: completed, total, failures })
+    setSyncNotice(`전체 동기화: 아이디 ${completed}/${total}개 완료${bulkCancelled.current ? ' (중간에 취소됨)' : ''}${failures.length ? `, 실패 ${failures.length}건` : ''}`)
     const current = base.find((item) => item.id === profileIdRef.current)
-    if (current) void loadCachedData(current)
+    if (current) void loadCachedData(current, accountSelRef.current)
   }
 
   async function cancelBulkSync() {
@@ -457,12 +580,25 @@ export default function App() {
     if (!profile || !isAdmin || !championData.length) return
     try {
       await persistProfiles(profiles)
-      await setDoc(await resolveSummaryRef(profile), {
-        account: { puuid: profile.puuid || '', gameName: profile.riotId, tagLine: profile.tag, ...(summaryMeta?.rank ? { rank: summaryMeta.rank } : {}) },
-        ...(summaryMeta?.totals ? { totals: summaryMeta.totals } : {}),
-        champions: championData,
-        syncedAt: profile.syncedAt.toISOString(),
-      })
+      const sel = accountSelRef.current
+      if (sel === 'all') {
+        await setDoc(aggregateRef(profile.id), {
+          aggregate: true,
+          account: { puuid: AGGREGATE_PUUID, gameName: profile.name, tagLine: '통합', rank: summaryMeta?.rank ?? '랭크 정보 없음' },
+          ...(summaryMeta?.accounts ? { accounts: summaryMeta.accounts } : {}),
+          ...(summaryMeta?.totals ? { totals: summaryMeta.totals } : {}),
+          champions: championData,
+          syncedAt: oldestSync(accountsOf(profile)).getTime() > 0 ? oldestSync(accountsOf(profile)).toISOString() : new Date().toISOString(),
+        })
+      } else {
+        const account = accountsOf(profile)[resolveSelection(sel, accountsOf(profile).length) as number]
+        await setDoc(await resolveAccountSummaryRef(profile, account), {
+          account: { puuid: account.puuid || '', gameName: account.riotId, tagLine: account.tag, ...(summaryMeta?.rank ? { rank: summaryMeta.rank } : {}) },
+          ...(summaryMeta?.totals ? { totals: summaryMeta.totals } : {}),
+          champions: championData,
+          syncedAt: account.syncedAt.toISOString(),
+        })
+      }
       setSharedData(true)
       setLocalOnlyData(false)
       setSyncNotice('현재 PC의 분석 결과를 공용 Firebase 데이터로 저장했습니다.')
@@ -510,6 +646,10 @@ export default function App() {
     void loadCachedData(next)
   }
 
+  function selectAccount(next: AccountSel) {
+    if (profile) void loadCachedData(profile, next)
+  }
+
   if (!profile) {
     return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <div className="onboarding-actions"><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button><button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터 관리</button></div>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}{isDataModalOpen && isAdmin && <DataModal profiles={profiles} bulk={bulk} syncBusy={isSyncing} onSyncAll={() => void syncAllProfiles()} onCancelSync={() => void cancelBulkSync()} onClose={() => setDataModalOpen(false)} onChanged={() => undefined} />}</main>
   }
@@ -528,8 +668,8 @@ export default function App() {
       <section className="hero" id="top">
         <div className="hero-copy"><p className="eyebrow"><Sparkles size={14} /> 개인 챔피언 분석</p><h1>LoL-Cham</h1></div>
         <div className="sync-card">
-          <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isSyncing ? '시즌 전적 동기화 중' : isLiveData ? '저장된 분석 데이터' : '동기화 대기'}</strong><small>{isSyncing ? syncProgress : `마지막 동기화: ${syncAge(profile.syncedAt)}`}</small>{isSyncing && <small className="sync-timing">{syncTiming}</small>}</div>
-          {hasLocalOnlyData && isAdmin ? <button className="refresh-button" onClick={() => void publishLocalData()}><Upload size={16} /> 공용 데이터로 저장</button> : isAdmin && hasSyncServer ? <button className={`refresh-button ${isSyncing ? 'cancel-sync' : ''}`} disabled={bulk.running} onClick={() => isSyncing ? void cancelSync() : void refreshData(profile)}>{isSyncing ? <X size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 취소' : '데이터 새로고침'}</button> : isAdmin ? <button className="refresh-button" disabled title="관리자 PC의 로컬 동기화 도구가 필요합니다."><RefreshCw size={16} /> 로컬 동기화 필요</button> : <button className="refresh-button" disabled title="관리자만 동기화할 수 있습니다."><RefreshCw size={16} /> 관리자 전용</button>}
+          <div><p>데이터 상태</p><strong><span className={`status-dot ${syncError ? 'error' : ''}`} /> {syncError ? '동기화 오류' : isSyncing ? '시즌 전적 동기화 중' : isLiveData ? '저장된 분석 데이터' : '동기화 대기'}</strong><small>{isSyncing ? syncProgress : `마지막 동기화: ${syncAge(displayedSyncedAt)}`}</small>{isSyncing && <small className="sync-timing">{syncTiming}</small>}</div>
+          {hasLocalOnlyData && isAdmin ? <button className="refresh-button" onClick={() => void publishLocalData()}><Upload size={16} /> 공용 데이터로 저장</button> : isAdmin && hasSyncServer ? <button className={`refresh-button ${isSyncing ? 'cancel-sync' : ''}`} disabled={bulk.running} onClick={() => isSyncing ? void cancelSync() : void refreshData(profile)}>{isSyncing ? <X size={16} /> : <RefreshCw size={16} />}{isSyncing ? '동기화 취소' : effectiveSel === 'all' ? '모든 아이디 새로고침' : '데이터 새로고침'}</button> : isAdmin ? <button className="refresh-button" disabled title="관리자 PC의 로컬 동기화 도구가 필요합니다."><RefreshCw size={16} /> 로컬 동기화 필요</button> : <button className="refresh-button" disabled title="관리자만 동기화할 수 있습니다."><RefreshCw size={16} /> 관리자 전용</button>}
         </div>
       </section>
       {syncError && <p className="sync-error"><CircleAlert size={15} /> {syncError}</p>}
@@ -540,10 +680,19 @@ export default function App() {
         <div className="profile-select-wrap">
           <label>분석 사용자</label>
           <div className="select-with-icon"><Users size={16} /><select value={profileId ?? ''} onChange={(event) => { const next = profiles.find((p) => p.id === Number(event.target.value)); if (next) selectProfile(next) }}>
-            {profiles.filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name} · {item.riotId}#{item.tag}</option>)}
+            {profiles.filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name} · {accountText(item)}{item.extraAccounts?.length ? ` 외 ${item.extraAccounts.length}개` : ''}</option>)}
           </select><ChevronDown size={16} /></div>
         </div>
-        <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div><strong>{profile.riotId}<span>#{profile.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></div></div>
+        {accounts.length > 1 && <div className="profile-select-wrap account-select-wrap">
+          <label>아이디</label>
+          <div className="select-with-icon"><Layers size={16} /><select value={effectiveSel} aria-label="아이디 선택" onChange={(event) => selectAccount(event.target.value === 'all' ? 'all' : Number(event.target.value))}>
+            <option value="all">모든 아이디 통합 ({accounts.length}개)</option>
+            {accounts.map((account) => <option key={account.index} value={account.index}>{accountText(account)}{account.index === 0 ? ' (대표)' : ''}</option>)}
+          </select><ChevronDown size={16} /></div>
+        </div>}
+        <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div>{effectiveSel === 'all'
+          ? <><strong>{profile.name}<span> · 통합</span></strong><p title={accounts.map(accountText).join(', ')}>아이디 {accounts.length}개 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></>
+          : <><strong>{selectedAccount.riotId}<span>#{selectedAccount.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></>}</div></div>
         <div className="profile-stats">
           <div className="profile-stat"><small>현재 티어</small><strong>{rankInfo ? rankInfo.label : '—'}</strong><span>{rankInfo ? rankInfo.points : isLiveData ? '랭크 정보 없음' : '동기화 필요'}</span></div>
           <div className="profile-stat"><small>시즌 승률</small><strong>{seasonRecord ? `${(seasonRecord.wins / seasonRecord.games * 100).toFixed(1)}%` : '—'}</strong><span>{seasonRecord ? `${seasonRecord.games}판 · ${seasonRecord.wins}승 ${seasonRecord.games - seasonRecord.wins}패` : '집계된 데이터 없음'}</span></div>
@@ -557,7 +706,7 @@ export default function App() {
       <section className="workspace">
         <div className="champion-panel panel">
           <div className="panel-heading"><div><p className="eyebrow">{laneLabels[lane]} 챔피언</p><h2>챔피언 목록 <small>{laneChampions.length}</small></h2></div><div className="filter-row"><label className="search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="챔피언 검색" /></label><select aria-label="정렬" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}><option value="ai">숙련도 점수순</option><option value="mastery">공식 숙련도순</option><option value="win">시즌 승률순</option></select></div></div>
-          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
+          <p className="data-notice"><CircleAlert size={14} /> {isLiveData ? `${isSharedData ? '공용 Firebase' : '현재 PC'}에 저장된 이번 시즌 솔로·자유랭크 분석 데이터입니다.${aggregateNote}${isAdmin ? ' 새 게임 반영은 관리자만 할 수 있습니다.' : ''}` : '저장된 분석 데이터가 없습니다. 관리자에게 동기화를 요청하세요.'}</p>
           <div className="table-head"><span>챔피언</span><span>공식 숙련도</span><span>숙련도 점수</span><span>시즌 승률</span><span>내 라인 평균 대비</span></div>
           <div className="champion-list">
             {laneChampions.map((champion) => <button key={championEntryId(champion)} className={`champion-row ${selectedId === championEntryId(champion) ? 'selected' : ''}`} onClick={() => setSelectedId(championEntryId(champion))}>
@@ -646,22 +795,26 @@ function ScoreBreakdown({ items, note }: { items: NonNullable<Champion['scoreBre
   </div>
 }
 
+// 사용자 추가·수정 창에서 입력 중인 값. 첫 번째 아이디가 대표 아이디다.
+type UserForm = { name: string; lane: Lane; accounts: { riotId: string; tag: string }[] }
+const emptyForm = (): UserForm => ({ name: '', lane: 'MID', accounts: [{ riotId: '', tag: '' }] })
+
 function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose: () => void; onSave: (profiles: Profile[]) => Promise<void> }) {
   const [rows, setRows] = useState(profiles)
   const [isAdding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState<number | null>(null)
-  const [form, setForm] = useState({ name: '', riotId: '', tag: '', lane: 'MID' as Lane })
+  const [form, setForm] = useState<UserForm>(emptyForm)
   const [isSaving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   function startEdit(user: Profile) {
-    setForm({ name: user.name, riotId: user.riotId, tag: user.tag, lane: user.lane })
+    setForm({ name: user.name, lane: user.lane, accounts: accountsOf(user).map((account) => ({ riotId: account.riotId, tag: account.tag })) })
     setEditingId(user.id)
     setAdding(true)
   }
   function removeUser(user: Profile) {
-    if (!window.confirm(`'${user.name}' (${user.riotId}#${user.tag}) 사용자를 삭제할까요?\n\n저장된 분석 데이터는 삭제되지 않습니다. 같은 Riot ID로 다시 추가하면 기존 분석 데이터를 그대로 사용합니다.\n\n'변경사항 저장'을 눌러야 삭제가 반영됩니다.`)) return
+    if (!window.confirm(`'${user.name}' (${accountsOf(user).map(accountText).join(', ')}) 사용자를 삭제할까요?\n\n저장된 분석 데이터는 삭제되지 않습니다. 같은 Riot ID로 다시 추가하면 기존 분석 데이터를 그대로 사용합니다.\n\n'변경사항 저장'을 눌러야 삭제가 반영됩니다.`)) return
     setRows((current) => current.filter((row) => row.id !== user.id))
-    if (editingId === user.id) { setEditingId(null); setAdding(false); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }
+    if (editingId === user.id) { setEditingId(null); setAdding(false); setForm(emptyForm()) }
   }
   function move(index: number, delta: number) {
     setRows((current) => {
@@ -673,17 +826,22 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     })
   }
   function saveForm() {
-    if (!form.name.trim() || !form.riotId.trim() || !form.tag.trim()) return
+    const rebuilt = form.name.trim() ? rebuildAccounts(editingId === null ? [] : accountsOf(rows.find((row) => row.id === editingId) ?? profiles[0]), form.accounts) : null
+    if (!rebuilt) return
+    const { primary, extras } = rebuilt
     if (editingId === null) {
-      setRows((current) => [...current, { id: Date.now(), ...form, active: true, syncedAt: new Date(0) }])
+      setRows((current) => [...current, {
+        id: Date.now(), name: form.name.trim(), lane: form.lane, riotId: primary.riotId, tag: primary.tag,
+        ...(extras.length ? { extraAccounts: extras } : {}), active: true, syncedAt: new Date(0),
+      }])
     } else {
-      setRows((current) => current.map((user) => {
-        if (user.id !== editingId) return user
-        const accountChanged = user.riotId.trim() !== form.riotId.trim() || user.tag.trim() !== form.tag.trim()
-        return accountChanged ? { ...user, ...form, puuid: undefined, syncedAt: new Date(0) } : { ...user, ...form }
+      // 이미 동기화한 아이디는 puuid·동기화 시각을 유지하고, 새로 넣거나 바꾼 아이디는 비워 둔다.
+      setRows((current) => current.map((user) => user.id !== editingId ? user : {
+        ...user, name: form.name.trim(), lane: form.lane, riotId: primary.riotId, tag: primary.tag,
+        puuid: primary.puuid, syncedAt: primary.syncedAt, extraAccounts: extras.length ? extras : undefined,
       }))
     }
-    setForm({ name: '', riotId: '', tag: '', lane: 'MID' })
+    setForm(emptyForm())
     setEditingId(null)
     setAdding(false)
   }
@@ -693,14 +851,22 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     try { await onSave(rows.map((row, index) => ({ ...row, order: index }))) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
   }
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다. 사용자를 삭제해도 저장된 분석 데이터는 남으며, 같은 Riot ID로 다시 추가하면 그대로 사용할 수 있습니다.</p>
-    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span> · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button><button className="user-delete" onClick={() => removeUser(user)} disabled={isSaving} aria-label={`${user.name} 사용자 삭제`} title="사용자 삭제"><Trash2 size={14} /></button></div>)}</div>
-    {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><input placeholder="Riot ID" value={form.riotId} onChange={(e) => setForm({ ...form, riotId: e.target.value })} /><input placeholder="태그 (예: KR1)" value={form.tag} onChange={(e) => setForm({ ...form, tag: e.target.value })} /><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm({ name: '', riotId: '', tag: '', lane: 'MID' }) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
+    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span>{user.extraAccounts?.length ? <span className="extra-count"> 외 {user.extraAccounts.length}개 아이디</span> : null} · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button><button className="user-delete" onClick={() => removeUser(user)} disabled={isSaving} aria-label={`${user.name} 사용자 삭제`} title="사용자 삭제"><Trash2 size={14} /></button></div>)}</div>
+    {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><div className="account-fields">
+      {form.accounts.map((account, index) => <div className="account-field" key={index}>
+        <input placeholder={index === 0 ? 'Riot ID (대표 아이디)' : 'Riot ID (추가 아이디)'} value={account.riotId} onChange={(e) => setForm({ ...form, accounts: form.accounts.map((item, position) => position === index ? { ...item, riotId: e.target.value } : item) })} />
+        <input placeholder="태그 (예: KR1)" value={account.tag} onChange={(e) => setForm({ ...form, accounts: form.accounts.map((item, position) => position === index ? { ...item, tag: e.target.value } : item) })} />
+        {form.accounts.length > 1 && <button type="button" className="user-delete" onClick={() => setForm({ ...form, accounts: form.accounts.filter((_, position) => position !== index) })} aria-label={`${index + 1}번째 아이디 삭제`}><Trash2 size={14} /></button>}
+      </div>)}
+      <button type="button" className="ghost-button add-account" onClick={() => setForm({ ...form, accounts: [...form.accounts, { riotId: '', tag: '' }] })}><Plus size={15} /> 아이디 추가</button>
+      <p className="form-hint">첫 번째 아이디가 대표 아이디입니다. 한 사용자에 아이디를 여러 개 넣으면 아이디별 통계와 ‘모든 아이디 통합’ 통계를 모두 볼 수 있습니다.</p>
+    </div><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm(emptyForm()) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
     {saveError && <p className="modal-error"><CircleAlert size={14} /> {saveError}</p>}
     <div className="modal-actions"><button className="ghost-button" onClick={onClose} disabled={isSaving}>취소</button><button className="primary-button" onClick={save} disabled={isSaving}>{isSaving ? '저장 중' : '변경사항 저장'}</button></div>
   </div></div>
 }
 
-type SharedDataEntry = { id: string; gameName: string; tagLine: string; championCount: number; syncedAt: string }
+type SharedDataEntry = { id: string; gameName: string; tagLine: string; championCount: number; syncedAt: string; aggregate?: boolean }
 
 function formatDateTime(value: string | null) {
   const date = value ? new Date(value) : null
@@ -720,7 +886,7 @@ function DataModal({ profiles, bulk, syncBusy, onSyncAll, onCancelSync, onClose,
       const snapshot = await getDocs(summariesCol)
       setShared(snapshot.docs.map((item) => {
         const data = item.data() as Partial<SyncResult>
-        return { id: item.id, gameName: data.account?.gameName ?? '', tagLine: data.account?.tagLine ?? '', championCount: data.champions?.length ?? 0, syncedAt: data.syncedAt ?? '' }
+        return { id: item.id, gameName: data.account?.gameName ?? '', tagLine: data.account?.tagLine ?? '', championCount: data.champions?.length ?? 0, syncedAt: data.syncedAt ?? '', aggregate: data.aggregate === true }
       }))
       setSharedError('')
     } catch (error) {
@@ -740,8 +906,10 @@ function DataModal({ profiles, bulk, syncBusy, onSyncAll, onCancelSync, onClose,
   // 처음 열 때와 전체 동기화가 끝났을 때 목록을 새로 불러온다.
   useEffect(() => { if (!bulk.running) void load() }, [bulk.running])
 
-  function linkedUser(entry: { id?: string; puuid?: string; gameName: string; tagLine: string }) {
-    return profiles.find((item) => (entry.id !== undefined && String(item.id) === entry.id) || accountMatchesProfile(item, entry))
+  function linkedUser(entry: { id?: string; puuid?: string; gameName: string; tagLine: string; aggregate?: boolean }) {
+    // 통합 데이터(agg-사용자ID)는 해당 사용자에게, 나머지는 사용자의 대표·추가 아이디 중 하나와 맞는 계정에 연결한다.
+    if (entry.aggregate) return profiles.find((item) => entry.id === `agg-${item.id}`)
+    return profiles.find((item) => (entry.id !== undefined && String(item.id) === entry.id) || accountsOf(item).some((account) => accountMatchesProfile(account, entry)))
   }
 
   async function remove(key: string, label: string, warning: string, action: () => Promise<void>) {
@@ -760,7 +928,7 @@ function DataModal({ profiles, bulk, syncBusy, onSyncAll, onCancelSync, onClose,
   }
 
   async function removeShared(entry: SharedDataEntry) {
-    await remove(`shared:${entry.id}`, `'${entry.gameName || '이름 없음'}#${entry.tagLine}'의 공용 Firebase`, '모든 사용자가 보는 분석 결과가 사라집니다. 사용자 정보는 삭제되지 않습니다.', () => deleteDoc(doc(summariesCol, entry.id)))
+    await remove(`shared:${entry.id}`, `'${entry.aggregate ? `통합 · ${entry.gameName}` : `${entry.gameName || '이름 없음'}#${entry.tagLine}`}'의 공용 Firebase`, '모든 사용자가 보는 분석 결과가 사라집니다. 사용자 정보는 삭제되지 않습니다.', () => deleteDoc(doc(summariesCol, entry.id)))
   }
 
   async function removeLocal(entry: LocalCacheEntry) {
@@ -776,8 +944,8 @@ function DataModal({ profiles, bulk, syncBusy, onSyncAll, onCancelSync, onClose,
 
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="저장 데이터 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">분석 결과 저장소</p><h2>저장 데이터 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div>
     <p className="modal-copy">저장된 분석 데이터가 어떤 Riot 계정의 것인지 확인하고 삭제합니다. 사용자 삭제와는 별개이며, 데이터가 남아 있으면 같은 Riot ID의 사용자를 다시 추가할 때 그대로 연결됩니다.</p>
-    {hasSyncServer && <section className="data-section bulk-sync"><h3>전체 사용자 동기화 <small>활성 사용자 {profiles.filter((item) => item.active).length}명</small></h3>
-      <p className="data-empty">활성 사용자를 한 명씩 차례로 동기화해 공용 데이터로 저장합니다. 경기가 많으면 오래 걸리며, 도중에 취소할 수 있습니다.</p>
+    {hasSyncServer && <section className="data-section bulk-sync"><h3>전체 사용자 동기화 <small>활성 사용자 {profiles.filter((item) => item.active).length}명 · 아이디 {profiles.filter((item) => item.active).reduce((sum, item) => sum + accountsOf(item).length, 0)}개</small></h3>
+      <p className="data-empty">활성 사용자의 모든 아이디를 하나씩 차례로 동기화해 공용 데이터로 저장합니다. 아이디가 여러 개인 사용자는 통합 통계도 함께 갱신합니다. 경기가 많으면 오래 걸리며, 도중에 취소할 수 있습니다.</p>
       {bulk.running
         ? <div className="bulk-progress"><div className="bulk-bar"><i style={{ width: `${bulk.total ? Math.round((bulk.done / bulk.total) * 100) : 0}%` }} /></div><p>{bulk.done}/{bulk.total}명 완료 · {bulk.message}</p><button className="ghost-button" onClick={onCancelSync}><X size={15} /> 취소</button></div>
         : <button className="primary-button" onClick={onSyncAll} disabled={syncBusy || !profiles.some((item) => item.active)}><RefreshCw size={15} /> {syncBusy ? '다른 동기화 진행 중' : '전체 사용자 동기화'}</button>}
@@ -786,7 +954,7 @@ function DataModal({ profiles, bulk, syncBusy, onSyncAll, onCancelSync, onClose,
     <section className="data-section"><h3>공용 Firebase 데이터 <small>{shared ? `${shared.length}개` : ''}</small></h3>
       {sharedError && <p className="modal-error"><CircleAlert size={14} /> {sharedError}</p>}
       {shared && !shared.length && <p className="data-empty">저장된 공용 데이터가 없습니다.</p>}
-      <div className="user-rows">{shared?.map((entry) => <div className="user-row" key={entry.id}><div className="user-initial">{(entry.gameName || '?').slice(0, 1)}</div><div><b>{entry.gameName || '이름 없음'}<span className="tag-suffix">#{entry.tagLine}</span></b><p>챔피언 {entry.championCount}개 · 마지막 동기화 {formatDateTime(entry.syncedAt)}</p><UserTag user={linkedUser(entry)} /></div><button className="user-delete with-label" onClick={() => void removeShared(entry)} disabled={busyKey !== ''}><Trash2 size={14} /> {busyKey === `shared:${entry.id}` ? '삭제 중' : '삭제'}</button></div>)}</div>
+      <div className="user-rows">{shared?.map((entry) => <div className="user-row" key={entry.id}><div className="user-initial">{(entry.gameName || '?').slice(0, 1)}</div><div><b>{entry.aggregate ? `통합 · ${entry.gameName}` : entry.gameName || '이름 없음'}{!entry.aggregate && <span className="tag-suffix">#{entry.tagLine}</span>}</b><p>챔피언 {entry.championCount}개 · 마지막 동기화 {formatDateTime(entry.syncedAt)}</p><UserTag user={linkedUser(entry)} /></div><button className="user-delete with-label" onClick={() => void removeShared(entry)} disabled={busyKey !== ''}><Trash2 size={14} /> {busyKey === `shared:${entry.id}` ? '삭제 중' : '삭제'}</button></div>)}</div>
     </section>
     {hasSyncServer && <section className="data-section"><h3>이 PC 서버 데이터 <small>{local ? `${local.length}개` : ''}</small></h3>
       {localError && <p className="modal-error"><CircleAlert size={14} /> {localError}</p>}
