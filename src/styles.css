@@ -106,7 +106,9 @@ select option:checked { background: #26364f; color: #fff; }
 
 /* 한 사용자에 여러 아이디 */
 .account-fields { grid-column: 1 / -1; display: grid; gap: 8px; }
-.account-field { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.account-field { display: grid; grid-template-columns: auto 1fr 1fr auto; gap: 8px; align-items: center; }
+.account-actions { display: flex; align-items: center; gap: 6px; min-width: 44px; justify-content: flex-end; }
+.primary-badge { padding: 3px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; color: #2a2110; background: #e0b866; white-space: nowrap; }
 .account-fields .add-account { justify-self: start; }
 .form-hint { margin: 0; color: #8190a5; font-size: 11px; line-height: 1.5; }
 .user-row .extra-count { color: #7fd8b3; margin-left: 4px; }

@@ -6,7 +6,7 @@ import {
   Pencil, Search, ShieldAlert, Sparkles, Trophy, Users, X, LogIn, LogOut, Upload, Trash2, Database, TrendingUp, Layers,
 } from 'lucide-react'
 import { auth, db, googleProvider } from './firebase'
-import { accountText, accountsOf, defaultSelection, normalizeRiotId, oldestSync, rebuildAccounts, resolveSelection, stripUndefined, withAccount, type AccountRef, type AccountSel, type RiotAccount } from './accounts'
+import { AGGREGATE_PUUID, accountText, accountsOf, defaultSelection, matchesAccount, mostPlayedLane, moveItem, normalizeRiotId, oldestSync, pickSummary, rebuildAccounts, resolveSelection, stripUndefined, withAccount, type AccountRef, type AccountSel, type RiotAccount } from './accounts'
 
 type Lane = 'TOP' | 'JUNGLE' | 'MID' | 'BOTTOM' | 'SUPPORT'
 
@@ -95,7 +95,6 @@ const sharedProfiles = collection(db, 'shared', 'chamlog', 'profiles')
 const summariesCol = collection(db, 'shared', 'chamlog', 'summaries')
 const summaryRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', String(profileId))
 // '모든 아이디 통합' 결과는 기존 summaries 컬렉션에 agg-사용자ID 로 저장한다(Firestore 규칙을 따로 바꿀 필요가 없다).
-const AGGREGATE_PUUID = 'aggregate'
 const aggregateRef = (profileId: number) => doc(db, 'shared', 'chamlog', 'summaries', `agg-${profileId}`)
 const syncApiBase = import.meta.env.VITE_SYNC_API_URL || '/api'
 const hasSyncServer = window.location.hostname === 'localhost' || Boolean(import.meta.env.VITE_SYNC_API_URL)
@@ -151,17 +150,7 @@ function aiGrade(score: number | null) {
 // 그래서 사용자를 삭제했다가 같은 Riot ID로 다시 추가해도 기존 분석 데이터를 그대로 쓸 수 있다.
 type AccountLike = { puuid?: string; gameName?: string; tagLine?: string }
 function accountMatchesProfile(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>, account?: AccountLike | null) {
-  if (!account || account.puuid === AGGREGATE_PUUID) return false
-  if (target.puuid && account.puuid) return target.puuid === account.puuid
-  const name = normalizeRiotId(account.gameName)
-  return Boolean(name) && name === normalizeRiotId(target.riotId) && normalizeRiotId(account.tagLine) === normalizeRiotId(target.tag)
-}
-async function resolveSummaryRef(target: Pick<Profile, 'id' | 'puuid' | 'riotId' | 'tag'>) {
-  const direct = summaryRef(target.id)
-  if ((await getDoc(direct)).exists()) return direct
-  const snapshot = await getDocs(summariesCol)
-  const matched = snapshot.docs.find((item) => accountMatchesProfile(target, (item.data() as SyncResult).account))
-  return matched ? matched.ref : direct
+  return matchesAccount(target, account)
 }
 async function findLocalPuuid(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>) {
   try {
@@ -174,27 +163,35 @@ async function findLocalPuuid(target: Pick<Profile, 'puuid' | 'riotId' | 'tag'>)
   }
 }
 
-// 한 아이디(대표 또는 추가)의 분석 결과를 저장할 문서. 대표 아이디는 예전 방식(사용자 ID) 문서도 인정하고, 추가 아이디는 계정으로만 찾는다.
-async function resolveAccountSummaryRef(profile: Profile, account: AccountRef) {
-  if (account.index === 0) return resolveSummaryRef({ id: profile.id, puuid: account.puuid, riotId: account.riotId, tag: account.tag })
+type SummaryCandidate = { id: string; ref: ReturnType<typeof summaryRef>; data: SyncResult; account: SyncResult['account'] }
+
+// 한 아이디의 저장된 분석 결과 문서를 찾는다. 사용자 ID로 저장된 예전 문서는 같은 계정일 때만 인정한다.
+// (대표 아이디를 바꾸면 그 문서는 이전 대표 아이디의 데이터이므로 새 대표 아이디의 것으로 보면 안 된다.)
+async function findSummaryDoc(profile: Profile, account: AccountRef) {
+  const direct = await getDoc(summaryRef(profile.id))
+  if (direct.exists()) {
+    const data = direct.data() as SyncResult
+    if (matchesAccount(account, data.account)) return { found: { ref: direct.ref, data }, directExists: true }
+  }
   const snapshot = await getDocs(summariesCol)
-  const matched = snapshot.docs.find((item) => accountMatchesProfile(account, (item.data() as SyncResult).account))
-  return matched ? matched.ref : doc(summariesCol, `acct-${(account.puuid ?? `${normalizeRiotId(account.riotId)}-${normalizeRiotId(account.tag)}`).replace(/\//g, '_')}`)
+  const candidates: SummaryCandidate[] = snapshot.docs.map((item) => { const data = item.data() as SyncResult; return { id: item.id, ref: item.ref, data, account: data.account } })
+  const matched = pickSummary<SummaryCandidate>(candidates, String(profile.id), account)
+  return { found: matched ? { ref: matched.ref, data: matched.data } : null, directExists: direct.exists() }
+}
+
+// 한 아이디의 분석 결과를 저장할 문서. 이미 있으면 그 문서, 없으면 새로 만든다.
+async function resolveAccountSummaryRef(profile: Profile, account: AccountRef) {
+  const { found, directExists } = await findSummaryDoc(profile, account)
+  if (found) return found.ref
+  // 새 문서: 사용자 ID 문서가 비어 있으면 그것을 쓰고, 다른 아이디의 데이터가 이미 있으면 계정 기준 id를 쓴다.
+  if (!directExists && account.index === 0) return summaryRef(profile.id)
+  return doc(summariesCol, `acct-${(account.puuid ?? `${normalizeRiotId(account.riotId)}-${normalizeRiotId(account.tag)}`).replace(/\//g, '_')}`)
 }
 
 // 한 아이디의 저장된 분석 결과를 찾는다: 공용 Firebase → (이 PC 서버가 있으면) 서버 저장 데이터 순서.
 async function fetchAccountSummary(profile: Profile, account: AccountRef): Promise<{ payload: SyncResult | null; localOnly: boolean }> {
-  let payload: SyncResult | null = null
-  if (account.index === 0) {
-    const direct = await getDoc(summaryRef(profile.id))
-    if (direct.exists()) payload = direct.data() as SyncResult
-  }
-  if (!payload) {
-    const snapshot = await getDocs(summariesCol)
-    const matched = snapshot.docs.find((item) => accountMatchesProfile(account, (item.data() as SyncResult).account))
-    if (matched) payload = matched.data() as SyncResult
-  }
-  if (payload) return { payload, localOnly: false }
+  const { found } = await findSummaryDoc(profile, account)
+  if (found) return { payload: found.data, localOnly: false }
   const localPuuid = account.puuid || await findLocalPuuid(account)
   if (!localPuuid) return { payload: null, localOnly: false }
   const response = await fetch(`${syncApiBase}/riot/summary/${encodeURIComponent(localPuuid)}`)
@@ -277,6 +274,8 @@ export default function App() {
   const effectiveSel: AccountSel = resolveSelection(accountSel, accounts.length)
   const selectedAccount = accounts[effectiveSel === 'all' ? 0 : effectiveSel]
   const displayedSyncedAt = effectiveSel === 'all' ? oldestSync(accounts) : (selectedAccount?.syncedAt ?? new Date(0))
+  // 주 라인은 따로 설정하지 않고, 지금 보는 데이터에서 판수가 가장 많은 라인으로 자동 결정한다.
+  const mainLane = mostPlayedLane(championData)
   // '모든 아이디 통합'을 보고 있을 때, 어떤 아이디가 포함됐는지 알려준다. (동기화하지 않은 아이디는 제외된다)
   const aggregateNote = effectiveSel === 'all' && summaryMeta?.accounts
     ? ` 통합 대상: ${summaryMeta.accounts.map((item) => `${item.gameName}#${item.tagLine}`).join(', ')}${summaryMeta.accounts.length < accounts.length ? ` (동기화되지 않은 ${accounts.length - summaryMeta.accounts.length}개 아이디는 제외)` : ''}.`
@@ -315,7 +314,6 @@ export default function App() {
         setProfiles(savedProfiles)
         const active = savedProfiles.find((item: Profile) => item.active) ?? savedProfiles[0]
         setProfileId(active.id)
-        setLane(active.lane)
         void loadCachedData(active)
       } catch (error) {
         setProfileError(error instanceof Error ? error.message : '사용자 정보를 불러오지 못했습니다.')
@@ -375,7 +373,7 @@ export default function App() {
       }
       setChampionData(loaded.champions)
       setLiveData(true)
-      const preferred = topChampion(loaded.champions, targetProfile.lane) as Champion
+      const preferred = topChampion(loaded.champions, mostPlayedLane(loaded.champions) ?? undefined) as Champion
       setLane(preferred.lane)
       setSelectedId(championEntryId(preferred))
     } catch (error) {
@@ -451,7 +449,7 @@ export default function App() {
             setChampionData(result.champions)
             setLiveData(true)
             setSummaryMeta({ rank: result.account.rank, totals: result.totals })
-            const preferred = topChampion(result.champions, lane) as Champion
+            const preferred = topChampion(result.champions, mostPlayedLane(result.champions) ?? undefined) as Champion
             setLane(preferred.lane)
             setSelectedId(championEntryId(preferred))
           }
@@ -571,7 +569,7 @@ export default function App() {
     await Promise.all(removed.map((old) => deleteDoc(doc(sharedProfiles, String(old.id)))))
     setProfiles(nextProfiles)
     const nextActive = nextProfiles.find((item) => item.id === profileId && item.active) ?? nextProfiles.find((item) => item.active)
-    if (nextActive) { setProfileId(nextActive.id); setLane(nextActive.lane); void loadCachedData(nextActive) }
+    if (nextActive) { setProfileId(nextActive.id); void loadCachedData(nextActive) }
     else if (!nextProfiles.some((item) => item.id === profileId)) { setProfileId(null); setChampionData([]); setSelectedId(''); setLiveData(false) }
     setUserModalOpen(false)
   }
@@ -642,7 +640,6 @@ export default function App() {
 
   function selectProfile(next: Profile) {
     setProfileId(next.id)
-    setLane(next.lane)
     void loadCachedData(next)
   }
 
@@ -651,7 +648,7 @@ export default function App() {
   }
 
   if (!profile) {
-    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID, 태그, 기본 라인을 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <div className="onboarding-actions"><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button><button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터 관리</button></div>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}{isDataModalOpen && isAdmin && <DataModal profiles={profiles} bulk={bulk} syncBusy={isSyncing} onSyncAll={() => void syncAllProfiles()} onCancelSync={() => void cancelBulkSync()} onClose={() => setDataModalOpen(false)} onChanged={() => undefined} />}</main>
+    return <main className="app-shell"><header className="topbar"><a className="brand" href="#top"><span>CHAM</span>LOG <i /></a><ManagerButton user={authUser} isAdmin={isAdmin} busy={authBusy} onSignIn={signInAsManager} onSignOut={signOutManager} /></header><section className="empty-onboarding"><Users size={34} /><p className="eyebrow">분석 사용자 없음</p><h1>먼저 분석할<br /><em>사용자</em>를 등록하세요.</h1><p>{isAdmin ? 'Riot ID와 태그를 저장한 뒤 데이터 새로고침을 눌러 첫 동기화를 진행하세요. 주 라인은 판수가 가장 많은 라인으로 자동 선택됩니다.' : '공용 분석 데이터가 아직 없습니다. 관리자가 로그인해 사용자를 추가할 수 있습니다.'}</p>{isAdmin && <div className="onboarding-actions"><button className="primary-button" onClick={() => setUserModalOpen(true)}><Plus size={17} /> 사용자 추가</button><button className="ghost-button" onClick={() => setDataModalOpen(true)}><Database size={17} /> 저장 데이터 관리</button></div>}</section>{isUserModalOpen && isAdmin && <UserModal profiles={profiles} onClose={() => setUserModalOpen(false)} onSave={saveUserProfiles} />}{isDataModalOpen && isAdmin && <DataModal profiles={profiles} bulk={bulk} syncBusy={isSyncing} onSyncAll={() => void syncAllProfiles()} onCancelSync={() => void cancelBulkSync()} onClose={() => setDataModalOpen(false)} onChanged={() => undefined} />}</main>
   }
 
   return (
@@ -686,13 +683,13 @@ export default function App() {
         {accounts.length > 1 && <div className="profile-select-wrap account-select-wrap">
           <label>아이디</label>
           <div className="select-with-icon"><Layers size={16} /><select value={effectiveSel} aria-label="아이디 선택" onChange={(event) => selectAccount(event.target.value === 'all' ? 'all' : Number(event.target.value))}>
-            <option value="all">모든 아이디 통합 ({accounts.length}개)</option>
             {accounts.map((account) => <option key={account.index} value={account.index}>{accountText(account)}{account.index === 0 ? ' (대표)' : ''}</option>)}
+            <option value="all">모든 아이디 통합 ({accounts.length}개)</option>
           </select><ChevronDown size={16} /></div>
         </div>}
         <div className="profile-info"><div className="rank-emblem"><Trophy size={20} /></div><div>{effectiveSel === 'all'
-          ? <><strong>{profile.name}<span> · 통합</span></strong><p title={accounts.map(accountText).join(', ')}>아이디 {accounts.length}개 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></>
-          : <><strong>{selectedAccount.riotId}<span>#{selectedAccount.tag}</span></strong><p>KR 서버 · 기본 라인 <b>{laneLabels[profile.lane]}</b></p></>}</div></div>
+          ? <><strong>{profile.name}<span> · 통합</span></strong><p title={accounts.map(accountText).join(', ')}>아이디 {accounts.length}개{mainLane ? <> · 주 라인 <b>{laneLabels[mainLane]}</b></> : null}</p></>
+          : <><strong>{selectedAccount.riotId}<span>#{selectedAccount.tag}</span></strong><p>KR 서버{mainLane ? <> · 주 라인 <b>{laneLabels[mainLane]}</b></> : null}</p></>}</div></div>
         <div className="profile-stats">
           <div className="profile-stat"><small>현재 티어</small><strong>{rankInfo ? rankInfo.label : '—'}</strong><span>{rankInfo ? rankInfo.points : isLiveData ? '랭크 정보 없음' : '동기화 필요'}</span></div>
           <div className="profile-stat"><small>시즌 승률</small><strong>{seasonRecord ? `${(seasonRecord.wins / seasonRecord.games * 100).toFixed(1)}%` : '—'}</strong><span>{seasonRecord ? `${seasonRecord.games}판 · ${seasonRecord.wins}승 ${seasonRecord.games - seasonRecord.wins}패` : '집계된 데이터 없음'}</span></div>
@@ -700,7 +697,7 @@ export default function App() {
       </section>
 
       <nav className="lane-tabs" aria-label="라인 선택">
-        {(Object.keys(laneLabels) as Lane[]).map((key) => <button key={key} className={lane === key ? 'active' : ''} onClick={() => switchLane(key)}>{laneLabels[key]}{profile.lane === key && <span>기본</span>}</button>)}
+        {(Object.keys(laneLabels) as Lane[]).map((key) => <button key={key} className={lane === key ? 'active' : ''} onClick={() => switchLane(key)}>{laneLabels[key]}{mainLane === key && <span>주</span>}</button>)}
       </nav>
 
       <section className="workspace">
@@ -796,8 +793,8 @@ function ScoreBreakdown({ items, note }: { items: NonNullable<Champion['scoreBre
 }
 
 // 사용자 추가·수정 창에서 입력 중인 값. 첫 번째 아이디가 대표 아이디다.
-type UserForm = { name: string; lane: Lane; accounts: { riotId: string; tag: string }[] }
-const emptyForm = (): UserForm => ({ name: '', lane: 'MID', accounts: [{ riotId: '', tag: '' }] })
+type UserForm = { name: string; accounts: { riotId: string; tag: string }[] }
+const emptyForm = (): UserForm => ({ name: '', accounts: [{ riotId: '', tag: '' }] })
 
 function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose: () => void; onSave: (profiles: Profile[]) => Promise<void> }) {
   const [rows, setRows] = useState(profiles)
@@ -807,7 +804,7 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
   const [isSaving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   function startEdit(user: Profile) {
-    setForm({ name: user.name, lane: user.lane, accounts: accountsOf(user).map((account) => ({ riotId: account.riotId, tag: account.tag })) })
+    setForm({ name: user.name, accounts: accountsOf(user).map((account) => ({ riotId: account.riotId, tag: account.tag })) })
     setEditingId(user.id)
     setAdding(true)
   }
@@ -831,13 +828,13 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     const { primary, extras } = rebuilt
     if (editingId === null) {
       setRows((current) => [...current, {
-        id: Date.now(), name: form.name.trim(), lane: form.lane, riotId: primary.riotId, tag: primary.tag,
+        id: Date.now(), name: form.name.trim(), lane: 'MID', riotId: primary.riotId, tag: primary.tag,
         ...(extras.length ? { extraAccounts: extras } : {}), active: true, syncedAt: new Date(0),
       }])
     } else {
       // 이미 동기화한 아이디는 puuid·동기화 시각을 유지하고, 새로 넣거나 바꾼 아이디는 비워 둔다.
       setRows((current) => current.map((user) => user.id !== editingId ? user : {
-        ...user, name: form.name.trim(), lane: form.lane, riotId: primary.riotId, tag: primary.tag,
+        ...user, name: form.name.trim(), riotId: primary.riotId, tag: primary.tag,
         puuid: primary.puuid, syncedAt: primary.syncedAt, extraAccounts: extras.length ? extras : undefined,
       }))
     }
@@ -851,16 +848,23 @@ function UserModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose
     try { await onSave(rows.map((row, index) => ({ ...row, order: index }))) } catch (error) { setSaveError(error instanceof Error ? error.message : '사용자 정보를 저장하지 못했습니다.') } finally { setSaving(false) }
   }
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="사용자 관리"><div className="modal"><div className="modal-head"><div><p className="eyebrow">프로젝트 사용자</p><h2>사용자 관리</h2></div><button onClick={onClose} className="icon-button" aria-label="닫기"><X size={20} /></button></div><p className="modal-copy">표시 이름과 Riot 계정 정보를 분리해 관리합니다. 비활성 사용자는 분석 사용자 목록에 표시되지 않습니다. 사용자를 삭제해도 저장된 분석 데이터는 남으며, 같은 Riot ID로 다시 추가하면 그대로 사용할 수 있습니다.</p>
-    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span>{user.extraAccounts?.length ? <span className="extra-count"> 외 {user.extraAccounts.length}개 아이디</span> : null} · KR · 기본 {laneLabels[user.lane]}</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button><button className="user-delete" onClick={() => removeUser(user)} disabled={isSaving} aria-label={`${user.name} 사용자 삭제`} title="사용자 삭제"><Trash2 size={14} /></button></div>)}</div>
+    <div className="user-rows">{rows.map((user, index) => <div className={`user-row ${user.active ? '' : 'inactive'}`} key={user.id}><div className="user-move"><button type="button" onClick={() => move(index, -1)} disabled={isSaving || index === 0} aria-label={`${user.name} 위로 이동`}><ChevronUp size={14} /></button><button type="button" onClick={() => move(index, 1)} disabled={isSaving || index === rows.length - 1} aria-label={`${user.name} 아래로 이동`}><ChevronDown size={14} /></button></div><div className="user-initial">{user.name.slice(0, 1)}</div><div><b>{user.name}</b><p>{user.riotId}<span>#{user.tag}</span>{user.extraAccounts?.length ? <span className="extra-count"> 외 {user.extraAccounts.length}개 아이디</span> : null} · KR</p></div><button className="user-edit" onClick={() => startEdit(user)} disabled={isSaving} aria-label={`${user.name} 정보 수정`}><Pencil size={14} /> 수정</button><button className="status-button" onClick={() => setRows((current) => current.map((row) => row.id === user.id ? { ...row, active: !row.active } : row))}>{user.active ? '활성' : '비활성'}</button><button className="user-delete" onClick={() => removeUser(user)} disabled={isSaving} aria-label={`${user.name} 사용자 삭제`} title="사용자 삭제"><Trash2 size={14} /></button></div>)}</div>
     {isAdding ? <div className="add-form"><input placeholder="표시 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><div className="account-fields">
       {form.accounts.map((account, index) => <div className="account-field" key={index}>
+        <div className="user-move">
+          <button type="button" onClick={() => setForm({ ...form, accounts: moveItem(form.accounts, index, -1) })} disabled={index === 0} aria-label={`${index + 1}번째 아이디를 위로 이동`}><ChevronUp size={14} /></button>
+          <button type="button" onClick={() => setForm({ ...form, accounts: moveItem(form.accounts, index, 1) })} disabled={index === form.accounts.length - 1} aria-label={`${index + 1}번째 아이디를 아래로 이동`}><ChevronDown size={14} /></button>
+        </div>
         <input placeholder={index === 0 ? 'Riot ID (대표 아이디)' : 'Riot ID (추가 아이디)'} value={account.riotId} onChange={(e) => setForm({ ...form, accounts: form.accounts.map((item, position) => position === index ? { ...item, riotId: e.target.value } : item) })} />
         <input placeholder="태그 (예: KR1)" value={account.tag} onChange={(e) => setForm({ ...form, accounts: form.accounts.map((item, position) => position === index ? { ...item, tag: e.target.value } : item) })} />
-        {form.accounts.length > 1 && <button type="button" className="user-delete" onClick={() => setForm({ ...form, accounts: form.accounts.filter((_, position) => position !== index) })} aria-label={`${index + 1}번째 아이디 삭제`}><Trash2 size={14} /></button>}
+        <div className="account-actions">
+          {index === 0 && <span className="primary-badge">대표</span>}
+          {form.accounts.length > 1 && <button type="button" className="user-delete" onClick={() => setForm({ ...form, accounts: form.accounts.filter((_, position) => position !== index) })} aria-label={`${index + 1}번째 아이디 삭제`}><Trash2 size={14} /></button>}
+        </div>
       </div>)}
       <button type="button" className="ghost-button add-account" onClick={() => setForm({ ...form, accounts: [...form.accounts, { riotId: '', tag: '' }] })}><Plus size={15} /> 아이디 추가</button>
-      <p className="form-hint">첫 번째 아이디가 대표 아이디입니다. 한 사용자에 아이디를 여러 개 넣으면 아이디별 통계와 ‘모든 아이디 통합’ 통계를 모두 볼 수 있습니다.</p>
-    </div><select value={form.lane} onChange={(e) => setForm({ ...form, lane: e.target.value as Lane })}>{(Object.keys(laneLabels) as Lane[]).map((key) => <option key={key} value={key}>{laneLabels[key]}</option>)}</select><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm(emptyForm()) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
+      <p className="form-hint">맨 위 아이디가 대표 아이디입니다. ▲▼로 순서를 바꾸면 대표 아이디도 바뀌며, 이미 동기화한 아이디의 분석 데이터는 그대로 유지됩니다. 주 라인은 설정하지 않아도 판수가 가장 많은 라인이 자동으로 선택됩니다.</p>
+    </div><button className="primary-button" onClick={saveForm}>{editingId === null ? '추가' : '수정 완료'}</button><button className="ghost-button" onClick={() => { setAdding(false); setEditingId(null); setForm(emptyForm()) }}>닫기</button></div> : <button className="add-user" onClick={() => { setAdding(true); setEditingId(null) }}><Plus size={17} /> 사용자 추가</button>}
     {saveError && <p className="modal-error"><CircleAlert size={14} /> {saveError}</p>}
     <div className="modal-actions"><button className="ghost-button" onClick={onClose} disabled={isSaving}>취소</button><button className="primary-button" onClick={save} disabled={isSaving}>{isSaving ? '저장 중' : '변경사항 저장'}</button></div>
   </div></div>
